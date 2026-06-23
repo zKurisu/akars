@@ -3,12 +3,13 @@ name = "akars"
 version = "0.1.0"
 edition = "2021"
 
-[build-dependencies]
-
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["net", "rt-multi-thread", "time"] }
+
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 lto = "thin"

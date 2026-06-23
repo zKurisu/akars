@@ -5,7 +5,7 @@ Rust rewrite entry point for AKA-00 hardware control on SG2002.
 Implemented scope:
 
 - USB camera capture from `/dev/cvi-usb-camera0` using the StarryOS ioctl protocol.
-- MJPEG decode and letterbox preprocessing through the SG2002 SDK OpenCV libraries.
+- MJPEG decode and letterbox preprocessing through the TPU SDK's OpenCV libraries.
 - YOLOv8 CVI runtime inference and postprocess from `aka-sg2002/detect.*`.
 - UART motor protocol from `aka-rk3588/motor/uart_motor_driver.*`.
 - ZP10D arm UART protocol from `aka-rk3588/arm`.
@@ -13,42 +13,56 @@ Implemented scope:
 
 `AKA-00/demo` and shell scripts are intentionally not rewritten here.
 
-Host builds compile the pure Rust pieces and use a TPU stub. SG2002 builds link the TPU/OpenCV SDK automatically when the target architecture is `riscv64`, or when `AKARS_LINK_SG2002=1` is set.
+Host builds compile the pure Rust pieces and use a TPU stub. SG2002 builds link
+the TPU SDK and its bundled OpenCV libraries for `riscv64gc-unknown-linux-musl`.
 
-Build for SG2002 (RISC-V musl, `riscv64gc-unknown-linux-musl`):
+Build for SG2002:
 
 ```bash
 cd akars
-./build-sg2002.sh
+scripts/setup.sh
+scripts/build.sh
 ```
 
-The script handles the cross-build details:
+`scripts/setup.sh` installs the Rust target, initializes the TPU SDK submodule,
+downloads the Xuantie V3.4.0 musl toolchain, verifies its SHA-256, and extracts
+it to `toolchains/xuantie-v3.4.0`. The TPU SDK lives at
+`toolchains/tpu-sdk-sg200x` as a git submodule.
 
-- Target is `riscv64gc-unknown-linux-musl`. The AKA-00 board runs a musl rootfs
-  (loader `/lib/ld-musl-riscv64v0p7_xthead.so.1`) and the original C++ `aka0`
-  project links the same TPU/OpenCV SDK with the musl toolchain. This is **not**
-  glibc and **not** the bare-metal `-none-elf` target.
-- That target's std is not installed via rustup, so std is built from source
-  with `-Zbuild-std` (needs the `rust-src` component on a nightly toolchain).
-- musl defaults to static-crt; the script forces dynamic linking so the binary
-  uses the board's musl loader and the SDK's `.so` files, and overrides the
-  dynamic-linker name to the board's `xthead` variant.
-- The SDK's GNU `ld` (binutils 2.35) rejects the modern RISC-V ISA attributes
-  emitted by current Rust/LLVM, so linking uses `rust-lld`.
-
-Override the SDK / toolchain locations by exporting before calling:
+For an offline setup, provide the toolchain archive explicitly:
 
 ```bash
-TPU_SDK_PATH=/path/to/cvitek_tpu_sdk \
-OPENCV_PATH=/path/to/cvitek_tpu_sdk/opencv \
-TC_BIN=/path/to/host-tools/gcc/riscv64-linux-musl-x86_64/bin \
-./build-sg2002.sh
+scripts/setup.sh --archive /path/to/Xuantie-900-gcc-linux-6.6.36-musl64-x86_64-V3.4.0-20260323.tar.gz
 ```
 
+Override local paths when needed:
+
+```bash
+AKARS_TOOLCHAIN_DIR=/path/to/xuantie-v3.4.0 \
+AKARS_TPU_SDK_DIR=/path/to/tpu-sdk-sg200x \
+scripts/build.sh
+```
+
+Build facts:
+
+- Target: `riscv64gc-unknown-linux-musl`. The AKA-00 board runs a musl rootfs,
+  not glibc and not bare-metal `-none-elf`.
+- Rust uses the prebuilt target `std`; nightly and `-Zbuild-std` are not needed.
+- `.cargo/config.toml` disables static CRT and requests the board loader:
+  `/lib/ld-musl-riscv64v0p7_xthead.so.1`.
+- `scripts/linker.sh` uses the Xuantie V3.4.0 GCC driver directly; its GNU ld
+  links current Rust output successfully.
+
 The output binary is `target/riscv64gc-unknown-linux-musl/release/akars`. On the
-device it needs the SDK's `libcviruntime.so`, `libcvikernel.so`, and
-`libopencv_*.so.3.2` reachable via `LD_LIBRARY_PATH` (the original `aka0`
-deployment already provides these).
+device it needs `libcviruntime.so`, `libcvikernel.so`, `libopencv_*.so.3.2`, and
+the matching `libstdc++.so.6` reachable via `LD_LIBRARY_PATH`.
+
+Upload the binary to a rootfs partition device, for example an SD card second
+partition:
+
+```bash
+scripts/upload.sh /dev/sda2
+```
 
 Run on device:
 

@@ -213,7 +213,10 @@ fn run_detect(cli: DetectCli) {
                     d.cls, d.score, d.bbox.x, d.bbox.y, d.bbox.w, d.bbox.h
                 );
             }
-            eprintln!("[detect] annotated image written to {}", cli.output.display());
+            eprintln!(
+                "[detect] annotated image written to {}",
+                cli.output.display()
+            );
         }
         Err(err) => {
             eprintln!("[detect] inference failed: {err}");

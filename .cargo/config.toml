@@ -1,21 +1,11 @@
-# SG2002 (RISC-V musl) cross-build settings.
+# SG2002 target configuration. Host builds are unaffected.
 #
-# Only applies when building --target riscv64gc-unknown-linux-musl; host builds
-# (x86_64) are unaffected.
-#
-# The AKA-00 board runs a musl rootfs (interpreter
-# /lib/ld-musl-riscv64v0p7_xthead.so.1), and the original C++ aka0 project links
-# the same TPU/OpenCV SDK with the musl toolchain. So we target musl, not glibc.
-#
-# The canonical way to build is ./build-sg2002.sh, which exports the cross
-# toolchain, rust-lld path, the board's musl dynamic-linker, and -Zbuild-std.
-# This file just pins the linker so a bare
-# `cargo build --target riscv64gc-unknown-linux-musl` (with the cross gcc on
-# PATH) uses the right one.
-#
-# Note: the SDK's GNU ld (binutils 2.35, Xuantie gcc 10.2.0) rejects the newer
-# RISC-V ISA attributes (zifencei, zca, ...) emitted by current Rust/LLVM, so the
-# build script links with rust-lld instead.
+# The AKA-00 board uses the xthead-named musl loader. The repo-managed Xuantie
+# V3.4.0 GCC toolchain provides the sysroot and linker for this target.
 
 [target.riscv64gc-unknown-linux-musl]
-linker = "riscv64-unknown-linux-musl-gcc"
+linker = "scripts/linker.sh"
+rustflags = [
+  "-C", "target-feature=-crt-static",
+  "-C", "link-arg=-Wl,--dynamic-linker=/lib/ld-musl-riscv64v0p7_xthead.so.1",
+]
