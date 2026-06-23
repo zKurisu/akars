@@ -5,7 +5,7 @@ AKARS_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 AKARS_TARGET="riscv64gc-unknown-linux-musl"
 AKARS_DYNAMIC_LINKER="/lib/ld-musl-riscv64v0p7_xthead.so.1"
 
-AKARS_TOOLCHAIN_URL="https://occ-oss-prod.oss-cn-hangzhou.aliyuncs.com/resource/1777015046405/Xuantie-900-gcc-linux-6.6.36-musl64-x86_64-V3.4.0-20260323.tar.gz"
+AKARS_TOOLCHAIN_URL="https://occ-oss-prod.oss-cn-hangzhou.aliyuncs.com/resource//1777015046405/Xuantie-900-gcc-linux-6.6.36-musl64-x86_64-V3.4.0-20260323.tar.gz"
 AKARS_TOOLCHAIN_SHA256="10306ce30f98c8168d47f59487da83ba869d5d191193654a27032835d9bb16f8"
 AKARS_TOOLCHAIN_ARCHIVE="Xuantie-900-gcc-linux-6.6.36-musl64-x86_64-V3.4.0-20260323.tar.gz"
 AKARS_TOOLCHAIN_EXTRACTED="Xuantie-900-gcc-linux-6.6.36-musl64-x86_64-V3.4.0"
