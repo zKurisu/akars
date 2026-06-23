@@ -16,7 +16,6 @@ AKARS_TOOLCHAIN_CACHE="$AKARS_TOOLCHAINS_DIR/.cache"
 AKARS_TOOLCHAIN_DIR="${AKARS_TOOLCHAIN_DIR:-$AKARS_TOOLCHAINS_DIR/$AKARS_TOOLCHAIN_NAME}"
 AKARS_TPU_SDK_SUBMODULE="toolchains/tpu-sdk-sg200x"
 AKARS_TPU_SDK_DIR="${AKARS_TPU_SDK_DIR:-$AKARS_ROOT/$AKARS_TPU_SDK_SUBMODULE}"
-AKARS_OPENCV_DIR="${AKARS_OPENCV_DIR:-$AKARS_TPU_SDK_DIR/opencv}"
 
 AKARS_CC="$AKARS_TOOLCHAIN_DIR/bin/riscv64-unknown-linux-musl-gcc"
 AKARS_CXX="$AKARS_TOOLCHAIN_DIR/bin/riscv64-unknown-linux-musl-g++"
@@ -29,6 +28,5 @@ akars_toolchain_ready() {
 akars_tpu_sdk_ready() {
   [[ -f "$AKARS_TPU_SDK_DIR/include/cviruntime.h" \
     && -f "$AKARS_TPU_SDK_DIR/lib/libcviruntime.so" \
-    && -f "$AKARS_OPENCV_DIR/include/opencv2/core.hpp" \
-    && -e "$AKARS_OPENCV_DIR/lib/libopencv_core.so" ]]
+    && -f "$AKARS_TPU_SDK_DIR/lib/libcvikernel.so" ]]
 }

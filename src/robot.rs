@@ -127,12 +127,11 @@ pub fn run_tennis_hunter(
         };
 
         eprintln!(
-            "[time] capture={:.1} pre={:.1}(dec={:.1} rsz={:.1} pack={:.1}) fwd={:.1} post={:.1} ms",
+            "[time] capture={:.1} pre={:.1}(dec={:.1} rsz={:.1}) fwd={:.1} post={:.1} ms",
             capture_us as f32 / 1000.0,
             timing.preprocess_us as f32 / 1000.0,
             timing.decode_us as f32 / 1000.0,
             timing.resize_us as f32 / 1000.0,
-            timing.pack_us as f32 / 1000.0,
             timing.forward_us as f32 / 1000.0,
             timing.postprocess_us as f32 / 1000.0,
         );

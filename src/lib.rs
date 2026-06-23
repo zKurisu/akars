@@ -1,6 +1,7 @@
 pub mod arm;
 pub mod camera;
 pub mod detector;
+pub mod image_bridge;
 pub mod linux;
 pub mod motor;
 pub mod robot;

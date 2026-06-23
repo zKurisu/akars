@@ -23,13 +23,11 @@ impl Default for InferenceConfig {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InferTiming {
-    /// JPEG decode (libjpeg) microseconds.
+    /// JPEG decode microseconds.
     pub decode_us: i64,
-    /// resize + pad microseconds.
+    /// Resize, letterbox clear, and planar pack microseconds.
     pub resize_us: i64,
-    /// BGR2RGB + split + memcpy microseconds.
-    pub pack_us: i64,
-    /// total preprocess (the C bridge call) microseconds.
+    /// total preprocess microseconds.
     pub preprocess_us: i64,
     /// CVI_NN_Forward microseconds.
     pub forward_us: i64,
@@ -58,6 +56,7 @@ impl Error for TpuError {}
 mod imp {
     use super::{CameraFrame, Detection, InferTiming, InferenceConfig, TpuError};
     use crate::detector::{correct_yolo_boxes, nms, parse_yolov8_output};
+    use crate::image_bridge;
     use std::ffi::{c_char, c_int, c_void, CString};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
@@ -127,29 +126,6 @@ mod imp {
             output_num: i32,
         ) -> i32;
         fn CVI_NN_CleanupModel(model: CviModelHandle) -> i32;
-
-        fn akars_mjpeg_to_rgb_planar(
-            jpeg: *const u8,
-            jpeg_len: usize,
-            dst: *mut u8,
-            dst_w: i32,
-            dst_h: i32,
-            src_w: *mut i32,
-            src_h: *mut i32,
-            decode_us: *mut i64,
-            resize_us: *mut i64,
-            pack_us: *mut i64,
-        ) -> i32;
-
-        fn akars_draw_detections(
-            image: *const u8,
-            image_len: usize,
-            boxes: *const f32,
-            classes: *const c_int,
-            scores: *const f32,
-            count: c_int,
-            out_path: *const c_char,
-        ) -> i32;
     }
 
     pub struct YoloModel {
@@ -162,6 +138,7 @@ mod imp {
         input_h: i32,
         input_w: i32,
         output_shapes: Vec<CviShape>,
+        preprocessor: image_bridge::ImagePreprocessor,
     }
 
     impl YoloModel {
@@ -223,6 +200,7 @@ mod imp {
                 input_h,
                 input_w,
                 output_shapes,
+                preprocessor: image_bridge::ImagePreprocessor::new(),
             })
         }
 
@@ -245,32 +223,22 @@ mod imp {
                 return Err(TpuError::new("input tensor pointer is null"));
             }
 
-            let mut decoded_w = 0;
-            let mut decoded_h = 0;
-            let mut decode_us = 0i64;
-            let mut resize_us = 0i64;
-            let mut pack_us = 0i64;
-            let pre_start = Instant::now();
-            let rc = unsafe {
-                akars_mjpeg_to_rgb_planar(
-                    frame.jpeg.as_ptr(),
-                    frame.jpeg.len(),
-                    input_ptr,
-                    self.input_w,
-                    self.input_h,
-                    &mut decoded_w,
-                    &mut decoded_h,
-                    &mut decode_us,
-                    &mut resize_us,
-                    &mut pack_us,
-                )
-            };
-            let preprocess_us = pre_start.elapsed().as_micros() as i64;
-            if rc != 0 {
+            let input_len = rgb_tensor_len(self.input_w, self.input_h)?;
+            let input_tensor = unsafe { &*self.input };
+            if input_tensor.mem_size < input_len {
                 return Err(TpuError::new(format!(
-                    "MJPEG decode/preprocess failed: {rc}"
+                    "input tensor buffer is too small: mem_size={} required={input_len}",
+                    input_tensor.mem_size
                 )));
             }
+            let input = unsafe { slice::from_raw_parts_mut(input_ptr, input_len) };
+
+            let pre_start = Instant::now();
+            let preprocess = self
+                .preprocessor
+                .mjpeg_to_rgb_planar(&frame.jpeg, input, self.input_w, self.input_h)
+                .map_err(|err| TpuError::new(format!("MJPEG decode/preprocess failed: {err}")))?;
+            let preprocess_us = pre_start.elapsed().as_micros() as i64;
 
             let fwd_start = Instant::now();
             let rc = unsafe {
@@ -291,13 +259,13 @@ mod imp {
             let mut detections = self.get_detections(config)?;
             nms(&mut detections, config.iou_threshold);
 
-            let image_w = if decoded_w > 0 {
-                decoded_w
+            let image_w = if preprocess.src_w > 0 {
+                preprocess.src_w
             } else {
                 frame.width as i32
             };
-            let image_h = if decoded_h > 0 {
-                decoded_h
+            let image_h = if preprocess.src_h > 0 {
+                preprocess.src_h
             } else {
                 frame.height as i32
             };
@@ -312,9 +280,8 @@ mod imp {
 
             if let Some(t) = timing.as_deref_mut() {
                 *t = InferTiming {
-                    decode_us,
-                    resize_us,
-                    pack_us,
+                    decode_us: preprocess.decode_us,
+                    resize_us: preprocess.resize_us,
                     preprocess_us,
                     forward_us,
                     postprocess_us,
@@ -323,8 +290,8 @@ mod imp {
             Ok(detections)
         }
 
-        /// Run inference on a standalone image (JPEG/PNG/... anything OpenCV can
-        /// decode) and write a copy with the detection boxes drawn to out_path.
+        /// Run inference on a standalone image and write a copy with the
+        /// detection boxes drawn to out_path.
         pub fn detect_image(
             &mut self,
             image: &[u8],
@@ -338,31 +305,8 @@ mod imp {
             };
             let detections = self.infer(&frame, config)?;
 
-            let boxes: Vec<f32> = detections
-                .iter()
-                .flat_map(|d| [d.bbox.x, d.bbox.y, d.bbox.w, d.bbox.h])
-                .collect();
-            let classes: Vec<c_int> = detections.iter().map(|d| d.cls as c_int).collect();
-            let scores: Vec<f32> = detections.iter().map(|d| d.score).collect();
-
-            let c_out = CString::new(out_path.as_os_str().as_bytes())
-                .map_err(|_| TpuError::new("output path contains NUL byte"))?;
-            let rc = unsafe {
-                akars_draw_detections(
-                    image.as_ptr(),
-                    image.len(),
-                    boxes.as_ptr(),
-                    classes.as_ptr(),
-                    scores.as_ptr(),
-                    detections.len() as c_int,
-                    c_out.as_ptr(),
-                )
-            };
-            if rc != 0 {
-                return Err(TpuError::new(format!(
-                    "failed to write annotated image: {rc}"
-                )));
-            }
+            image_bridge::draw_detections(image, &detections, out_path)
+                .map_err(|err| TpuError::new(format!("failed to write annotated image: {err}")))?;
             Ok(detections)
         }
 
@@ -396,6 +340,16 @@ mod imp {
                 }
             }
         }
+    }
+
+    fn rgb_tensor_len(width: i32, height: i32) -> Result<usize, TpuError> {
+        if width <= 0 || height <= 0 {
+            return Err(TpuError::new("input tensor dimensions must be positive"));
+        }
+        (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| TpuError::new("input tensor dimensions overflow"))
     }
 
     fn tensor_to_f32(
@@ -447,7 +401,7 @@ mod imp {
     impl YoloModel {
         pub fn open(_path: &Path) -> Result<Self, TpuError> {
             Err(TpuError::new(
-                "akars was built without SG2002 TPU/OpenCV runtime support",
+                "akars was built without SG2002 TPU runtime support",
             ))
         }
 
@@ -457,7 +411,7 @@ mod imp {
             _config: InferenceConfig,
         ) -> Result<Vec<Detection>, TpuError> {
             Err(TpuError::new(
-                "akars was built without SG2002 TPU/OpenCV runtime support",
+                "akars was built without SG2002 TPU runtime support",
             ))
         }
 
@@ -468,7 +422,7 @@ mod imp {
             _timing: Option<&mut InferTiming>,
         ) -> Result<Vec<Detection>, TpuError> {
             Err(TpuError::new(
-                "akars was built without SG2002 TPU/OpenCV runtime support",
+                "akars was built without SG2002 TPU runtime support",
             ))
         }
 
@@ -479,7 +433,7 @@ mod imp {
             _config: InferenceConfig,
         ) -> Result<Vec<Detection>, TpuError> {
             Err(TpuError::new(
-                "akars was built without SG2002 TPU/OpenCV runtime support",
+                "akars was built without SG2002 TPU runtime support",
             ))
         }
     }

@@ -5,7 +5,7 @@ Rust rewrite entry point for AKA-00 hardware control on SG2002.
 Implemented scope:
 
 - USB camera capture from `/dev/cvi-usb-camera0` using the StarryOS ioctl protocol.
-- MJPEG decode and letterbox preprocessing through the TPU SDK's OpenCV libraries.
+- MJPEG decode and letterbox preprocessing through a pure Rust image pipeline.
 - YOLOv8 CVI runtime inference and postprocess from `aka-sg2002/detect.*`.
 - UART motor protocol from `aka-rk3588/motor/uart_motor_driver.*`.
 - ZP10D arm UART protocol from `aka-rk3588/arm`.
@@ -14,7 +14,7 @@ Implemented scope:
 `AKA-00/demo` and shell scripts are intentionally not rewritten here.
 
 Host builds compile the pure Rust pieces and use a TPU stub. SG2002 builds link
-the TPU SDK and its bundled OpenCV libraries for `riscv64gc-unknown-linux-musl`.
+only the TPU SDK runtime libraries for `riscv64gc-unknown-linux-musl`.
 
 Build for SG2002:
 
@@ -54,8 +54,8 @@ Build facts:
   links current Rust output successfully.
 
 The output binary is `target/riscv64gc-unknown-linux-musl/release/akars`. On the
-device it needs `libcviruntime.so`, `libcvikernel.so`, `libopencv_*.so.3.2`, and
-the matching `libstdc++.so.6` reachable via `LD_LIBRARY_PATH`.
+device it needs `libcviruntime.so`, `libcvikernel.so`, and the matching
+`libstdc++.so.6` reachable via `LD_LIBRARY_PATH`.
 
 Upload the binary to a rootfs partition device, for example an SD card second
 partition:

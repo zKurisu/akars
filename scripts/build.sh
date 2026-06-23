@@ -19,7 +19,6 @@ fi
 
 export AKARS_TOOLCHAIN_DIR
 export AKARS_TPU_SDK_DIR
-export AKARS_OPENCV_DIR
 export PATH="$AKARS_TOOLCHAIN_DIR/bin:$PATH"
 export CC="${CC:-$AKARS_CC}"
 export CXX="${CXX:-$AKARS_CXX}"
