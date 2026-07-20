@@ -136,14 +136,14 @@ pub fn run_tennis_hunter(
             timing.postprocess_us as f32 / 1000.0,
         );
 
-        // handle_detections(
-        //     &detections,
-        //     frame.width as i32,
-        //     frame.height as i32,
-        //     &mut robot,
-        //     &mut motor,
-        //     &mut arm,
-        // );
+        handle_detections(
+            &detections,
+            frame.width as i32,
+            frame.height as i32,
+            &mut robot,
+            &mut motor,
+            &mut arm,
+        );
 
         let frame_time = frame_start.elapsed();
         total_time += frame_time;

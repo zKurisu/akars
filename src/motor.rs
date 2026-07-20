@@ -13,6 +13,8 @@ const CMD_STOP: u8 = 0x11;
 const CMD_BRAKE: u8 = 0x12;
 const CMD_RESET: u8 = 0xFF;
 
+const RSP_ACK: u8 = 0x80;
+
 #[derive(Debug, Clone)]
 pub struct MotorConfig {
     pub device: String,
@@ -42,6 +44,9 @@ pub struct Motor {
 
 impl Motor {
     pub fn open(config: &MotorConfig) -> io::Result<Self> {
+        // The UART pads need muxing before the port will physically transmit;
+        // the device tree enables UART1 but leaves its pins unrouted.
+        crate::pinmux::configure_for_device(&config.device);
         let port = SerialPort::open(&config.device, 115200, true)?;
         eprintln!("[dbg][motor] port opened, sleeping 100ms");
         thread::sleep(Duration::from_millis(100));
@@ -93,11 +98,17 @@ impl Motor {
     }
 
     fn cmd_init(&mut self) {
-        eprintln!("[dbg][motor] cmd_init: send_frame");
         self.send_frame(CMD_INIT, &[]);
-        eprintln!("[dbg][motor] cmd_init: send_frame returned, recv_frame(500ms)");
-        let _ = self.recv_frame(Duration::from_millis(500));
-        eprintln!("[dbg][motor] cmd_init: recv_frame returned");
+        match self.recv_frame(Duration::from_millis(500)) {
+            Ok(Some((RSP_ACK, _))) => eprintln!("[motor] CMD_INIT: got ACK, ESP32 is responding"),
+            Ok(Some((cmd, _))) => {
+                eprintln!("[motor] CMD_INIT: unexpected reply 0x{cmd:02X} (not ACK)")
+            }
+            Ok(None) => eprintln!(
+                "[motor] CMD_INIT: NO REPLY (timeout) — ESP32 not talking on this port/wiring"
+            ),
+            Err(err) => eprintln!("[motor] CMD_INIT: serial read error: {err}"),
+        }
     }
 
     fn cmd_config(&mut self, ppr: u16, pwm_freq: u16) {
