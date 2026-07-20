@@ -218,11 +218,45 @@ mod imp {
             config: InferenceConfig,
             mut timing: Option<&mut InferTiming>,
         ) -> Result<Vec<Detection>, TpuError> {
+            let (input_ptr, input_len) = self.input_buffer()?;
+            let input = unsafe { slice::from_raw_parts_mut(input_ptr, input_len) };
+
+            // Camera already delivers I422 planar at the model input size, so
+            // this is a plain color convert into the RGB planar tensor: no JPEG
+            // decode, no resize, no letterbox.
+            let pre_start = Instant::now();
+            image_bridge::yuv422p_to_rgb_planar(
+                &frame.pixels,
+                input,
+                self.input_w,
+                self.input_h,
+            )
+            .map_err(|err| TpuError::new(format!("YUV preprocess failed: {err}")))?;
+            let preprocess_us = pre_start.elapsed().as_micros() as i64;
+
+            let (detections, forward_us, postprocess_us) =
+                self.forward_and_detections(config, frame.width as i32, frame.height as i32)?;
+
+            if let Some(t) = timing.as_deref_mut() {
+                *t = InferTiming {
+                    decode_us: 0,
+                    resize_us: preprocess_us,
+                    preprocess_us,
+                    forward_us,
+                    postprocess_us,
+                };
+            }
+            Ok(detections)
+        }
+
+        /// Resolve the input tensor's backing buffer as a raw pointer and its
+        /// required RGB-planar length. Returned as a raw pointer (not a slice)
+        /// so callers can also borrow `self` afterwards.
+        fn input_buffer(&self) -> Result<(*mut u8, usize), TpuError> {
             let input_ptr = unsafe { CVI_NN_TensorPtr(self.input) as *mut u8 };
             if input_ptr.is_null() {
                 return Err(TpuError::new("input tensor pointer is null"));
             }
-
             let input_len = rgb_tensor_len(self.input_w, self.input_h)?;
             let input_tensor = unsafe { &*self.input };
             if input_tensor.mem_size < input_len {
@@ -231,15 +265,19 @@ mod imp {
                     input_tensor.mem_size
                 )));
             }
-            let input = unsafe { slice::from_raw_parts_mut(input_ptr, input_len) };
+            Ok((input_ptr, input_len))
+        }
 
-            let pre_start = Instant::now();
-            let preprocess = self
-                .preprocessor
-                .mjpeg_to_rgb_planar(&frame.jpeg, input, self.input_w, self.input_h)
-                .map_err(|err| TpuError::new(format!("MJPEG decode/preprocess failed: {err}")))?;
-            let preprocess_us = pre_start.elapsed().as_micros() as i64;
-
+        /// Run the network on the already-populated input tensor and turn the
+        /// output into detections. `image_w`/`image_h` are the original frame
+        /// dimensions used to map boxes back out of the letterboxed input.
+        /// Returns the detections plus forward/postprocess timings (µs).
+        fn forward_and_detections(
+            &mut self,
+            config: InferenceConfig,
+            image_w: i32,
+            image_h: i32,
+        ) -> Result<(Vec<Detection>, i64, i64), TpuError> {
             let fwd_start = Instant::now();
             let rc = unsafe {
                 CVI_NN_Forward(
@@ -258,17 +296,6 @@ mod imp {
             let post_start = Instant::now();
             let mut detections = self.get_detections(config)?;
             nms(&mut detections, config.iou_threshold);
-
-            let image_w = if preprocess.src_w > 0 {
-                preprocess.src_w
-            } else {
-                frame.width as i32
-            };
-            let image_h = if preprocess.src_h > 0 {
-                preprocess.src_h
-            } else {
-                frame.height as i32
-            };
             correct_yolo_boxes(
                 &mut detections,
                 image_h,
@@ -278,32 +305,37 @@ mod imp {
             );
             let postprocess_us = post_start.elapsed().as_micros() as i64;
 
-            if let Some(t) = timing.as_deref_mut() {
-                *t = InferTiming {
-                    decode_us: preprocess.decode_us,
-                    resize_us: preprocess.resize_us,
-                    preprocess_us,
-                    forward_us,
-                    postprocess_us,
-                };
-            }
-            Ok(detections)
+            Ok((detections, forward_us, postprocess_us))
         }
 
-        /// Run inference on a standalone image and write a copy with the
-        /// detection boxes drawn to out_path.
+        /// Run inference on a standalone image (JPEG/PNG/...) and write a copy
+        /// with the detection boxes drawn to out_path. Unlike the camera hot
+        /// path this decodes and letterboxes the image on the CPU.
         pub fn detect_image(
             &mut self,
             image: &[u8],
             out_path: &Path,
             config: InferenceConfig,
         ) -> Result<Vec<Detection>, TpuError> {
-            let frame = CameraFrame {
-                jpeg: image.to_vec(),
-                width: 0,
-                height: 0,
+            let (input_ptr, input_len) = self.input_buffer()?;
+            let input = unsafe { slice::from_raw_parts_mut(input_ptr, input_len) };
+
+            let preprocess = self
+                .preprocessor
+                .mjpeg_to_rgb_planar(image, input, self.input_w, self.input_h)
+                .map_err(|err| TpuError::new(format!("MJPEG decode/preprocess failed: {err}")))?;
+
+            let image_w = if preprocess.src_w > 0 {
+                preprocess.src_w
+            } else {
+                self.input_w
             };
-            let detections = self.infer(&frame, config)?;
+            let image_h = if preprocess.src_h > 0 {
+                preprocess.src_h
+            } else {
+                self.input_h
+            };
+            let (detections, _, _) = self.forward_and_detections(config, image_w, image_h)?;
 
             image_bridge::draw_detections(image, &detections, out_path)
                 .map_err(|err| TpuError::new(format!("failed to write annotated image: {err}")))?;
