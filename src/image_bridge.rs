@@ -129,6 +129,99 @@ impl ImagePreprocessor {
     }
 }
 
+/// Convert a YUV422 planar (I422 / YU16) frame into an RGB planar tensor (R
+/// plane, then G plane, then B plane), without resizing. The source dimensions
+/// must equal the destination dimensions; the camera is configured to output
+/// frames at exactly the model input size.
+///
+/// I422 stores three separate planes: a full-size Y plane (w×h), then a U plane
+/// and a V plane each subsampled horizontally only (w/2 × h). Two horizontally
+/// adjacent pixels share one U/V sample. Uses full-range BT.601 (JFIF)
+/// coefficients so the result matches the RGB the old JPEG decode path produced,
+/// keeping the model input distribution stable.
+pub fn yuv422p_to_rgb_planar(
+    yuv: &[u8],
+    dst: &mut [u8],
+    width: i32,
+    height: i32,
+) -> Result<(), ImageBridgeError> {
+    let (w, h) = valid_dimensions(width, height)?;
+    let w = w as usize;
+    let h = h as usize;
+    let y_size = w * h;
+    let chroma_w = w / 2;
+    let chroma_size = chroma_w * h;
+
+    if yuv.len() < y_size + 2 * chroma_size {
+        return Err(ImageBridgeError::InvalidInput(
+            "YUV input smaller than one I422 frame",
+        ));
+    }
+    if dst.len() < y_size * 3 {
+        return Err(ImageBridgeError::InvalidInput(
+            "destination tensor buffer is too small",
+        ));
+    }
+
+    let (y_plane, chroma) = yuv.split_at(y_size);
+    let (u_plane, v_plane) = chroma.split_at(chroma_size);
+    let (r_plane, rest) = dst.split_at_mut(y_size);
+    let (g_plane, b_plane) = rest.split_at_mut(y_size);
+
+    for row in 0..h {
+        let y_row = row * w;
+        let chroma_row = row * chroma_w;
+        for col in 0..w {
+            let y = y_plane[y_row + col] as i32;
+            let chroma_idx = chroma_row + col / 2;
+            let u = u_plane[chroma_idx] as i32 - 128;
+            let v = v_plane[chroma_idx] as i32 - 128;
+
+            let r = y + ((91881 * v) >> 16);
+            let g = y - ((22554 * u + 46802 * v) >> 16);
+            let b = y + ((116130 * u) >> 16);
+
+            let idx = y_row + col;
+            r_plane[idx] = clamp_u8(r);
+            g_plane[idx] = clamp_u8(g);
+            b_plane[idx] = clamp_u8(b);
+        }
+    }
+    Ok(())
+}
+
+/// Convert an I422 frame to RGB and save it as an image (format inferred from
+/// the output path extension). Handy for inspecting the raw YUV camera path.
+pub fn save_yuv422p(
+    yuv: &[u8],
+    width: i32,
+    height: i32,
+    out_path: &Path,
+) -> Result<(), ImageBridgeError> {
+    let (w, h) = valid_dimensions(width, height)?;
+    let plane = (w as usize) * (h as usize);
+    let mut planar = vec![0u8; plane * 3];
+    yuv422p_to_rgb_planar(yuv, &mut planar, width, height)?;
+
+    let mut image = RgbImage::new(w, h);
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let idx = y * w as usize + x;
+            image.put_pixel(
+                x as u32,
+                y as u32,
+                Rgb([planar[idx], planar[plane + idx], planar[2 * plane + idx]]),
+            );
+        }
+    }
+    save_rgb_image(&image, out_path)
+}
+
+#[inline]
+fn clamp_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
 pub fn draw_detections(
     image: &[u8],
     detections: &[crate::detector::Detection],

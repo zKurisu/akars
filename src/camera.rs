@@ -7,8 +7,12 @@ use std::path::Path;
 
 const CVI_CAMERA_IOCTL_INIT: u64 = 1;
 const CVI_CAMERA_IOCTL_GET_INFO: u64 = 2;
-const CVI_CAMERA_IOCTL_GET_FRAME: u64 = 3;
-const FRAME_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+// cmd 4: kernel returns a raw YUV422 planar (I422) frame instead of MJPEG.
+const CVI_CAMERA_IOCTL_GET_FRAME: u64 = 4;
+const YUV_FRAME_WIDTH: usize = 640;
+const YUV_FRAME_HEIGHT: usize = 480;
+// I422: full-size Y plane + U and V planes each subsampled horizontally (w/2 × h).
+const YUV_FRAME_SIZE: usize = YUV_FRAME_WIDTH * YUV_FRAME_HEIGHT * 2;
 const JPEG_MARKER_START: [u8; 2] = [0xFF, 0xD8];
 const JPEG_MARKER_END: [u8; 2] = [0xFF, 0xD9];
 
@@ -44,7 +48,8 @@ impl RawCameraInfo {
 
 #[derive(Debug)]
 pub struct CameraFrame {
-    pub jpeg: Vec<u8>,
+    /// Raw YUV422 planar (I422) pixels: Y plane, then U plane, then V plane.
+    pub pixels: Vec<u8>,
     pub width: u16,
     pub height: u16,
 }
@@ -92,7 +97,7 @@ impl UsbCamera {
     }
 
     pub fn get_frame(&mut self) -> io::Result<CameraFrame> {
-        let mut buffer = vec![0u8; FRAME_BUFFER_SIZE];
+        let mut buffer = vec![0u8; YUV_FRAME_SIZE];
         let ret = unsafe {
             linux::ioctl(
                 self.file.as_raw_fd(),
@@ -103,17 +108,24 @@ impl UsbCamera {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
-
+ 
+        eprintln!("[camera] ioctl returned {ret} bytes");
+        // The kernel may signal success with 0 or report the byte count; either
+        // way we expect one full I420 frame in the buffer.
         let size = ret as usize;
-        buffer.truncate(size);
-        if !is_valid_jpeg(&buffer) {
-            eprintln!("[camera] warning: captured frame is not a complete JPEG");
+
+        if size != 0 && size < YUV_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "camera returned a short YUV frame",
+            ));
         }
+        buffer.truncate(YUV_FRAME_SIZE);
 
         Ok(CameraFrame {
-            jpeg: buffer,
-            width: self.info.width,
-            height: self.info.height,
+            pixels: buffer,
+            width: YUV_FRAME_WIDTH as u16,
+            height: YUV_FRAME_HEIGHT as u16,
         })
     }
 }

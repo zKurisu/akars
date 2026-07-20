@@ -261,14 +261,18 @@ fn run_capture(cli: CaptureCli) {
         }
     };
 
-    if let Err(err) = std::fs::write(&cli.output, &frame.jpeg) {
+    if let Err(err) = akars::image_bridge::save_yuv422p(
+        &frame.pixels,
+        frame.width as i32,
+        frame.height as i32,
+        &cli.output,
+    ) {
         eprintln!("[capture] failed to write {}: {err}", cli.output.display());
         std::process::exit(1);
     }
 
     eprintln!(
-        "[capture] wrote {} byte(s) ({}x{}) to {}",
-        frame.jpeg.len(),
+        "[capture] wrote {}x{} frame to {}",
         frame.width,
         frame.height,
         cli.output.display()
