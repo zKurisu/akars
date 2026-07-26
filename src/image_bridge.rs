@@ -3,6 +3,7 @@ use image::{DynamicImage, ExtendedColorType, ImageFormat, Rgb, RgbImage};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
+use std::io::Cursor;
 use std::path::Path;
 use std::time::Instant;
 use zune_core::bytestream::ZCursor;
@@ -129,10 +130,9 @@ impl ImagePreprocessor {
     }
 }
 
-/// Convert a YUV422 planar (I422 / YU16) frame into an RGB planar tensor (R
-/// plane, then G plane, then B plane), without resizing. The source dimensions
-/// must equal the destination dimensions; the camera is configured to output
-/// frames at exactly the model input size.
+/// Convert a YUV422 planar (I422 / YU16) frame into a destination-size RGB
+/// planar tensor (R plane, then G plane, then B plane), with letterbox padding
+/// when the source and destination dimensions differ.
 ///
 /// I422 stores three separate planes: a full-size Y plane (w×h), then a U plane
 /// and a V plane each subsampled horizontally only (w/2 × h). Two horizontally
@@ -141,28 +141,30 @@ impl ImagePreprocessor {
 /// keeping the model input distribution stable.
 pub fn yuv422p_to_rgb_planar(
     yuv: &[u8],
+    src_w: i32,
+    src_h: i32,
     dst: &mut [u8],
-    width: i32,
-    height: i32,
+    dst_w: i32,
+    dst_h: i32,
 ) -> Result<(), ImageBridgeError> {
-    let (w, h) = valid_dimensions(width, height)?;
-    let w = w as usize;
-    let h = h as usize;
-    if (w & 1) != 0 {
-        return Err(ImageBridgeError::InvalidInput(
-            "I422 conversion requires an even image width",
-        ));
-    }
-    let y_size = w * h;
-    let chroma_w = w / 2;
-    let chroma_size = chroma_w * h;
+    let (sw, sh) = valid_dimensions(src_w, src_h)?;
+    let (dw, dh) = valid_dimensions(dst_w, dst_h)?;
+    let sw = sw as usize;
+    let sh = sh as usize;
+    let dw = dw as usize;
+    let dh = dh as usize;
+
+    let y_size = sw * sh;
+    let chroma_w = sw / 2;
+    let chroma_size = chroma_w * sh;
 
     if yuv.len() < y_size + 2 * chroma_size {
         return Err(ImageBridgeError::InvalidInput(
             "YUV input smaller than one I422 frame",
         ));
     }
-    if dst.len() < y_size * 3 {
+    let dst_plane = dw * dh;
+    if dst.len() < dst_plane * 3 {
         return Err(ImageBridgeError::InvalidInput(
             "destination tensor buffer is too small",
         ));
@@ -170,51 +172,47 @@ pub fn yuv422p_to_rgb_planar(
 
     let (y_plane, chroma) = yuv.split_at(y_size);
     let (u_plane, v_plane) = chroma.split_at(chroma_size);
-    let (r_plane, rest) = dst.split_at_mut(y_size);
-    let (g_plane, b_plane) = rest.split_at_mut(y_size);
 
-    yuv422p_to_rgb_planar_scalar(y_plane, u_plane, v_plane, r_plane, g_plane, b_plane, w, h);
-    Ok(())
-}
+    // Letterbox: maintain aspect ratio, center in destination.
+    let scale = (dw as f64 / sw as f64).min(dh as f64 / sh as f64);
+    let rw = ((sw as f64 * scale) as usize).max(1);
+    let rh = ((sh as f64 * scale) as usize).max(1);
+    let pad_left = (dw - rw) / 2;
+    let pad_top = (dh - rh) / 2;
 
-fn yuv422p_to_rgb_planar_scalar(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
-    r_plane: &mut [u8],
-    g_plane: &mut [u8],
-    b_plane: &mut [u8],
-    w: usize,
-    h: usize,
-) {
-    let chroma_w = w / 2;
+    // Clear destination first (letterbox padding areas = black).
+    dst[..dst_plane * 3].fill(0);
 
-    // I422 shares one U/V sample across two horizontal pixels, so compute the
-    // chroma contribution once per pair and reuse it for both luma samples.
-    for row in 0..h {
-        let y_row = row * w;
+    for row in 0..sh {
+        // Map source row to destination row with scaling.
+        let dst_row = pad_top + (row * rh / sh.max(1));
+        if dst_row >= dh {
+            continue;
+        }
+        let y_row = row * sw;
         let chroma_row = row * chroma_w;
-        for pair in 0..chroma_w {
-            let chroma_idx = chroma_row + pair;
+        for col in 0..sw {
+            let dst_col = pad_left + (col * rw / sw.max(1));
+            if dst_col >= dw {
+                continue;
+            }
+            let y = y_plane[y_row + col] as i32;
+            let chroma_idx = chroma_row + col / 2;
             let u = u_plane[chroma_idx] as i32 - 128;
             let v = v_plane[chroma_idx] as i32 - 128;
-            let r_uv = (91881 * v) >> 16;
-            let g_uv = (22554 * u + 46802 * v) >> 16;
-            let b_uv = (116130 * u) >> 16;
 
-            let idx0 = y_row + pair * 2;
-            let y0 = y_plane[idx0] as i32;
-            r_plane[idx0] = clamp_u8(y0 + r_uv);
-            g_plane[idx0] = clamp_u8(y0 - g_uv);
-            b_plane[idx0] = clamp_u8(y0 + b_uv);
+            let r = y + ((91881 * v) >> 16);
+            let g = y - ((22554 * u + 46802 * v) >> 16);
+            let b = y + ((116130 * u) >> 16);
 
-            let idx1 = idx0 + 1;
-            let y1 = y_plane[idx1] as i32;
-            r_plane[idx1] = clamp_u8(y1 + r_uv);
-            g_plane[idx1] = clamp_u8(y1 - g_uv);
-            b_plane[idx1] = clamp_u8(y1 + b_uv);
+            // Save to planar RGB: R plane, G plane, B plane.
+            let idx = dst_row * dw + dst_col;
+            dst[idx] = clamp_u8(r);
+            dst[dst_plane + idx] = clamp_u8(g);
+            dst[dst_plane * 2 + idx] = clamp_u8(b);
         }
     }
+    Ok(())
 }
 
 /// Convert an I422 frame to RGB and save it as an image (format inferred from
@@ -228,7 +226,7 @@ pub fn save_yuv422p(
     let (w, h) = valid_dimensions(width, height)?;
     let plane = (w as usize) * (h as usize);
     let mut planar = vec![0u8; plane * 3];
-    yuv422p_to_rgb_planar(yuv, &mut planar, width, height)?;
+    yuv422p_to_rgb_planar(yuv, width, height, &mut planar, width, height)?;
 
     let mut image = RgbImage::new(w, h);
     for y in 0..h as usize {
@@ -242,6 +240,46 @@ pub fn save_yuv422p(
         }
     }
     save_rgb_image(&image, out_path)
+}
+
+/// Convert a YUV422 planar frame directly to JPEG bytes in memory.
+/// Reuses the existing YUV→RGB planar conversion then JPEG-encodes via the
+/// `image` crate.  `quality` is 0–100 (JPEG quality level).
+pub fn yuv422p_to_jpeg_bytes(
+    yuv: &[u8],
+    width: i32,
+    height: i32,
+    quality: u8,
+) -> Result<Vec<u8>, ImageBridgeError> {
+    let (w, h) = valid_dimensions(width, height)?;
+    let plane = (w as usize) * (h as usize);
+    let mut planar = vec![0u8; plane * 3];
+    yuv422p_to_rgb_planar(yuv, width, height, &mut planar, width, height)?;
+
+    let mut image = RgbImage::new(w, h);
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let idx = y * w as usize + x;
+            image.put_pixel(
+                x as u32,
+                y as u32,
+                Rgb([planar[idx], planar[plane + idx], planar[2 * plane + idx]]),
+            );
+        }
+    }
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut encoder = JpegEncoder::new_with_quality(&mut buf, quality);
+    encoder
+        .encode(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgb8,
+        )
+        .map_err(ImageBridgeError::Save)?;
+
+    Ok(buf.into_inner())
 }
 
 #[inline]
@@ -258,12 +296,19 @@ pub fn draw_detections(
         return Err(ImageBridgeError::InvalidInput("empty image input"));
     }
 
+    eprintln!(
+        "[draw] loading image from memory ({} bytes), {} detections to draw ...",
+        image.len(),
+        detections.len()
+    );
     let mut rgb = image::load_from_memory(image)
         .map_err(ImageBridgeError::ImageDecode)?
         .into_rgb8();
+    eprintln!("[draw] decoded to {}x{} RGB", rgb.width(), rgb.height());
     for detection in detections {
         draw_detection(&mut rgb, detection);
     }
+    eprintln!("[draw] saving to {} ...", out_path.display());
     save_rgb_image(&rgb, out_path)
 }
 

@@ -7,33 +7,40 @@
 //! registers (base `0x0300_1000`) from user space. Its text interface takes
 //! one `"0xOFFSET VALUE"` line per pad; offsets are relative to the FMUX base.
 //!
-//! UART1 is muxed onto the JTAG pads (function select = 4):
-//!   - `JTAG_CPU_TMS` @ FMUX 0x64 -> UART1_TX
-//!   - `JTAG_CPU_TCK` @ FMUX 0x68 -> UART1_RX
+//! UART1 is muxed onto the JTAG pads:
+//!   - `JTAG_CPU_TMS` @ FMUX 0x64 -> UART1_TX  (FSEL=6)
+//!   - `JTAG_CPU_TCK` @ FMUX 0x68 -> UART1_RX  (FSEL=6)
 //! Configuring this consumes the JTAG pins (debug JTAG becomes unavailable).
+//!
+//! UART2 is muxed onto GPIOA pads:
+//!   - GPIOA28 @ FMUX 0x70 -> UART2_TX  (FSEL=2)
+//!   - GPIOA29 @ FMUX 0x74 -> UART2_RX  (FSEL=2)
+//!
+//! UART3 is muxed onto GPIOP pads:
+//!   - GPIOP19 @ FMUX 0xD4 -> UART3_TX  (FSEL=5)
+//!   - GPIOP20 @ FMUX 0xD8 -> UART3_RX  (FSEL=5)
+//! **Warning**: GPIOP18-21 default to SDIO (WiFi); enabling UART3 breaks WiFi.
 
 use std::io::{self, Write};
 
 const PINMUX_DEVICE: &str = "/dev/pinmux";
 
-// FMUX register offsets (relative to 0x0300_1000) and the UART function select.
-// On the JTAG pads the UART1 TX/RX function is FSEL=6 (FSEL=4 there is the
-// RTS/CTS flow-control function, not TX/RX).
+// ── UART1 (JTAG pads) ──────────────────────────────────────────────
 const FMUX_JTAG_CPU_TMS: u32 = 0x64;
 const FMUX_JTAG_CPU_TCK: u32 = 0x68;
 const FSEL_UART1: u32 = 6;
 
-// UART2 TX/RX on the IIC0_SCL / IIC0_SDA pads (FSEL=2).
-const FMUX_IIC0_SCL: u32 = 0x70;
-const FMUX_IIC0_SDA: u32 = 0x74;
+// ── UART2 (GPIOA28/A29) ────────────────────────────────────────────
+const FMUX_GPIOA28: u32 = 0x70;
+const FMUX_GPIOA29: u32 = 0x74;
 const FSEL_UART2: u32 = 2;
 
+// ── UART3 (GPIOP19/P20) ────────────────────────────────────────────
+const FMUX_GPIOP19: u32 = 0xD4;
+const FMUX_GPIOP20: u32 = 0xD8;
+const FSEL_UART3: u32 = 5;
+
 /// Write one FMUX register through `/dev/pinmux` using its text interface.
-///
-/// The whole `"0xOFFSET VALUE"` line must reach the device in a single write:
-/// the kernel parses each write independently, so `write!`/`write_fmt` (which
-/// emits one syscall per format fragment) would deliver partial tokens and be
-/// rejected with EINVAL. Format first, then one `write_all`.
 fn write_fmux(offset: u32, value: u32) -> io::Result<()> {
     let mut dev = std::fs::OpenOptions::new()
         .write(true)
@@ -51,29 +58,39 @@ pub fn configure_uart1() -> io::Result<()> {
     Ok(())
 }
 
-/// Route the IIC0 pads to UART2 TX/RX so `/dev/ttyS2` can drive the arm servo
-/// controller. The IIC0 bus becomes unavailable after this.
+/// Route GPIOA28/A29 to UART2 TX/RX for `/dev/ttyS2` (ZP10S servo arm).
 pub fn configure_uart2() -> io::Result<()> {
-    write_fmux(FMUX_IIC0_SCL, FSEL_UART2)?;
-    write_fmux(FMUX_IIC0_SDA, FSEL_UART2)?;
+    write_fmux(FMUX_GPIOA28, FSEL_UART2)?;
+    write_fmux(FMUX_GPIOA29, FSEL_UART2)?;
+    Ok(())
+}
+
+/// Route GPIOP19/P20 to UART3 TX/RX for `/dev/ttyS3` (motor ESP32).
+///
+/// **Warning**: GPIOP18-21 default to SDIO (WiFi); enabling UART3 will
+/// break WiFi connectivity on this board.
+pub fn configure_uart3() -> io::Result<()> {
+    write_fmux(FMUX_GPIOP19, FSEL_UART3)?;
+    write_fmux(FMUX_GPIOP20, FSEL_UART3)?;
     Ok(())
 }
 
 /// Configure pin-mux for whichever UART backs `device`, based on the `ttySN`
-/// alias. UART1 (`ttyS1`) and UART2 (`ttyS2`) are handled; other ports are
-/// left untouched with a warning so a mistargeted path is visible.
+/// alias.
 pub fn configure_for_device(device: &str) {
-    if device.ends_with("ttyS1") {
-        match configure_uart1() {
-            Ok(()) => eprintln!("[pinmux] UART1 pads routed (JTAG TMS/TCK -> UART1 TX/RX)"),
-            Err(err) => eprintln!("[pinmux] failed to configure UART1 via {PINMUX_DEVICE}: {err}"),
-        }
+    let result = if device.ends_with("ttyS1") {
+        configure_uart1()
     } else if device.ends_with("ttyS2") {
-        match configure_uart2() {
-            Ok(()) => eprintln!("[pinmux] UART2 pads routed (IIC0 SCL/SDA -> UART2 TX/RX)"),
-            Err(err) => eprintln!("[pinmux] failed to configure UART2 via {PINMUX_DEVICE}: {err}"),
-        }
+        configure_uart2()
+    } else if device.ends_with("ttyS3") {
+        configure_uart3()
     } else {
         eprintln!("[pinmux] no pinmux profile for {device}; assuming pads already muxed");
+        return;
+    };
+
+    match result {
+        Ok(()) => eprintln!("[pinmux] {device} pads routed"),
+        Err(err) => eprintln!("[pinmux] failed to configure {device} via {PINMUX_DEVICE}: {err}"),
     }
 }

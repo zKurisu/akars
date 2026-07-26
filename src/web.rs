@@ -1,13 +1,16 @@
 use crate::arm::Arm;
 use crate::motor::{Motor, MotorConfig};
 use axum::extract::{Query, State};
-use axum::response::Html;
+use axum::http::{header, StatusCode};
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct WebConfig {
@@ -15,15 +18,18 @@ pub struct WebConfig {
     pub motor_device: String,
     pub arm_device: String,
     pub mock: bool,
+    /// Optional USB camera device for live streaming (e.g. /dev/cvi-usb-camera0).
+    pub camera_device: Option<String>,
 }
 
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 8080)),
-            motor_device: "/dev/ttyS3".to_string(),
+            motor_device: "/dev/ttyS1".to_string(),
             arm_device: "/dev/ttyS2".to_string(),
             mock: false,
+            camera_device: None,
         }
     }
 }
@@ -32,6 +38,8 @@ impl Default for WebConfig {
 struct AppState {
     config: WebConfig,
     hardware: Arc<Mutex<HardwareState>>,
+    /// Latest camera frame as JPEG bytes, shared with capture thread.
+    camera_frame: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 struct HardwareState {
@@ -94,13 +102,64 @@ struct ArmActionRequest {
 
 pub async fn serve(config: WebConfig) -> io::Result<()> {
     let hardware = HardwareState::open(&config);
+    let camera_frame: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+
+    // If a camera device was given, start a background thread that
+    // continuously captures frames and encodes them to JPEG.
+    if let Some(ref camera_path) = config.camera_device {
+        let frame_buf = camera_frame.clone();
+        let path = camera_path.clone();
+        eprintln!("[web] starting camera stream on {path}");
+        thread::Builder::new()
+            .name("camera-stream".into())
+            .spawn(move || {
+                let mut camera = match crate::camera::UsbCamera::open(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[camera-stream] failed to open {path}: {e}");
+                        return;
+                    }
+                };
+                // Discard the first few frames so auto-exposure settles.
+                for _ in 0..10 {
+                    let _ = camera.get_frame();
+                }
+                loop {
+                    match camera.get_frame() {
+                        Ok(frame) => {
+                            match crate::image_bridge::yuv422p_to_jpeg_bytes(
+                                &frame.pixels,
+                                frame.width as i32,
+                                frame.height as i32,
+                                75,
+                            ) {
+                                Ok(jpeg) => {
+                                    *frame_buf.lock().unwrap() = Some(jpeg);
+                                }
+                                Err(e) => {
+                                    eprintln!("[camera-stream] JPEG encode: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[camera-stream] capture: {e}");
+                            thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                }
+            })
+            .expect("spawn camera-stream thread");
+    }
+
     let app_state = AppState {
         config: config.clone(),
         hardware: Arc::new(Mutex::new(hardware)),
+        camera_frame,
     };
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/camera.jpg", get(camera_jpeg))
         .route("/api/status", get(status))
         .route("/api/control", get(control))
         .route("/api/drive", post(drive))
@@ -117,6 +176,21 @@ pub async fn serve(config: WebConfig) -> io::Result<()> {
 
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+async fn camera_jpeg(State(state): State<AppState>) -> impl IntoResponse {
+    let jpeg = state.camera_frame.lock().unwrap().clone();
+    match jpeg {
+        Some(data) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+            ],
+            data,
+        )
+            .into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
@@ -615,6 +689,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </header>
 
   <main>
+    <!-- Camera view (shows live feed when --camera is used) -->
+    <section id="camera-section" style="display:none">
+      <h2>摄像头</h2>
+      <div style="text-align:center; margin-bottom:8px">
+        <img id="cam" src="" alt="摄像头画面"
+             style="width:100%; max-width:640px; border-radius:6px; background:#0f1319; border:1px solid var(--line)">
+      </div>
+    </section>
+
     <section>
       <h2>底盘</h2>
       <div class="readout">
@@ -782,6 +865,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
       button.addEventListener("pointercancel", up);
       button.addEventListener("pointerleave", up);
     });
+
+    // Camera polling: refresh every 200 ms.  Cache-bust with timestamp.
+    (function pollCamera() {
+      const img = document.getElementById("cam");
+      if (!img) return;
+      img.onload = () => {
+        document.getElementById("camera-section").style.display = "";
+        setTimeout(pollCamera, 200);
+      };
+      img.onerror = () => {
+        setTimeout(pollCamera, 800);
+      };
+      img.src = "/camera.jpg?t=" + Date.now();
+    })();
 
     refresh();
     setInterval(refresh, 1000);

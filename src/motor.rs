@@ -28,7 +28,7 @@ impl Default for MotorConfig {
     fn default() -> Self {
         Self {
             device: "/dev/ttyS1".to_string(),
-            speed_scale: 85,
+            speed_scale: 150,
             ppr: 4680,
             pwm_freq: 20000,
             min_speed: 15,
@@ -156,7 +156,9 @@ impl Motor {
 
         if let Some(port) = &mut self.port {
             if let Err(err) = port.write_all_drain(&frame) {
-                eprintln!("[motor] write failed: {err}");
+                eprintln!("[motor] write cmd=0x{cmd:02X} failed: {err}");
+            } else {
+                eprintln!("[motor] wrote cmd=0x{cmd:02X} len={} ok", payload.len());
             }
         }
     }
