@@ -355,12 +355,13 @@ fn chase_speed(area_ratio: f32) -> i32 {
     if area_ratio >= GRAB_AREA {
         return 0; // close enough — stop
     }
-    if area_ratio < 0.20 {
+    if area_ratio < 0.10 {
         return CHASE_SPEED; // far away: full speed 56
     }
-    // 20 % → GRAB_AREA (55 %): linear ramp 56 → 8
-    let t = (area_ratio - 0.20) / (GRAB_AREA - 0.20);
-    let speed = CHASE_SPEED as f32 * (1.0 - t) + 8.0 * t;
+    // 10 % → GRAB_AREA (55 %): linear ramp 56 → 5 (creep)
+    // Decelerates early so the car doesn't overshoot at 3–5 FPS.
+    let t = (area_ratio - 0.10) / (GRAB_AREA - 0.10);
+    let speed = CHASE_SPEED as f32 * (1.0 - t) + 5.0 * t;
     speed.round().max(1.0) as i32
 }
 
