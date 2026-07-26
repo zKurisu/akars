@@ -180,8 +180,25 @@ pub fn yuv422p_to_rgb_planar(
     let pad_left = (dw - rw) / 2;
     let pad_top = (dh - rh) / 2;
 
-    // Clear destination first (letterbox padding areas = black).
-    dst[..dst_plane * 3].fill(0);
+    // Only clear the letterbox padding bands instead of the entire 1.2 MB
+    // output buffer.  For square model inputs with a 4:3 camera frame the
+    // padding is always vertical (top + bottom), never horizontal, so we
+    // skip the expensive full-buffer fill(0).
+    let top_rows = pad_top;
+    let bottom_rows = dh.saturating_sub(pad_top + rh);
+    if top_rows > 0 {
+        let n = top_rows * dw;
+        dst[..n].fill(0);
+        dst[dst_plane..dst_plane + n].fill(0);
+        dst[dst_plane * 2..dst_plane * 2 + n].fill(0);
+    }
+    if bottom_rows > 0 {
+        let off = (pad_top + rh) * dw;
+        let n = bottom_rows * dw;
+        dst[off..off + n].fill(0);
+        dst[dst_plane + off..dst_plane + off + n].fill(0);
+        dst[dst_plane * 2 + off..dst_plane * 2 + off + n].fill(0);
+    }
 
     for row in 0..sh {
         // Map source row to destination row with scaling.

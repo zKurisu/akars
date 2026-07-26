@@ -48,18 +48,18 @@ impl Arm {
     pub fn set_angle(&mut self, servo_id: i32, angle: f32, time_ms: i32) {
         let clamped = angle.clamp(0.0, ANGLE_MAX);
         let pulse = angle_to_pulse(clamped);
-        let cmd = format!("#{servo_id:03}P{pulse:04}T{time_ms}!");
+        let cmd = format!("#{servo_id:03}P{pulse:04}T{time_ms}!\r\n");
         eprintln!("[arm] set servo {servo_id} angle={clamped} pulse={pulse} time={time_ms}");
         self.send_command(&cmd);
     }
 
     pub fn release_torque(&mut self, servo_id: i32) {
-        self.send_command(&format!("#{servo_id:03}PULK"));
+        self.send_command(&format!("#{servo_id:03}PULK\r\n"));
     }
 
     pub fn restore_torque(&mut self, servo_id: i32) {
         eprintln!("[arm] restore_torque servo {servo_id}");
-        self.send_command(&format!("#{servo_id:03}PULR"));
+        self.send_command(&format!("#{servo_id:03}PULR\r\n"));
     }
 
     /// 5-step grab sequence:
@@ -74,28 +74,28 @@ impl Arm {
         // Step 2: servo0 swings down, servo1 pushes toward ball.
         eprintln!("[arm] step 2: reach down (s0={S0_REACH} s1={S1_PUSH})");
         self.set_angle(0, S0_REACH, 1000);
-        sleep_ms(50);
+        sleep_ms(300);
         self.set_angle(1, S1_PUSH, 1000);
-        sleep_ms(1200);
+        sleep_ms(1500); // let both moves finish
 
-        // Step 3: open gripper wide, servo1 keeps going down.
-        eprintln!("[arm] step 3: open gripper (s2={S2_OPEN} s1={S1_CONTINUE})");
-        self.set_angle(2, S2_OPEN, 800);
-        sleep_ms(50);
-        self.set_angle(1, S1_CONTINUE, 800);
-        sleep_ms(1000);
+        // Step 3: open gripper wide WHILE servo1 keeps going down.
+        eprintln!("[arm] step 3: open gripper + push (s2={S2_OPEN} s1={S1_CONTINUE})");
+        self.set_angle(2, S2_OPEN, 1000);
+        sleep_ms(300);
+        self.set_angle(1, S1_CONTINUE, 1000);
+        sleep_ms(1500); // both moves are 1000ms, wait for completion
 
         // Step 4: close gripper — grab the ball.
         eprintln!("[arm] step 4: close gripper (s2={S2_CLOSE})");
-        self.set_angle(2, S2_CLOSE, 600);
-        sleep_ms(800);
+        self.set_angle(2, S2_CLOSE, 1000);
+        sleep_ms(1500);
 
         // Step 5: lift arm back to ready position.
         eprintln!("[arm] step 5: lift back (s0={S0_READY} s1={S1_READY})");
         self.set_angle(0, S0_READY, 1000);
-        sleep_ms(50);
+        sleep_ms(300);
         self.set_angle(1, S1_READY, 1000);
-        sleep_ms(1200);
+        sleep_ms(1500);
 
         eprintln!("[arm] === grab sequence done ===");
     }
