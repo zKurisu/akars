@@ -141,16 +141,14 @@ mod imp {
         preprocessor: image_bridge::ImagePreprocessor,
     }
 
-    // The model handle is owned by a single TPU worker thread. We do not share
-    // it across threads; we only move ownership into the worker.
-    unsafe impl Send for YoloModel {}
-
     impl YoloModel {
         pub fn open(path: &Path) -> Result<Self, TpuError> {
+            eprintln!("[tpu] CVI_NN_RegisterModel({}) ...", path.display());
             let c_path = CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| TpuError::new("model path contains NUL byte"))?;
             let mut model: CviModelHandle = ptr::null_mut();
             let rc = unsafe { CVI_NN_RegisterModel(c_path.as_ptr(), &mut model) };
+            eprintln!("[tpu] CVI_NN_RegisterModel → rc={}", rc);
             if rc != CVI_RC_SUCCESS {
                 return Err(TpuError::new(format!("CVI_NN_RegisterModel failed: {rc}")));
             }
@@ -168,6 +166,10 @@ mod imp {
                     &mut output_num,
                 )
             };
+            eprintln!(
+                "[tpu] CVI_NN_GetInputOutputTensors → rc={} input_num={} output_num={}",
+                rc, input_num, output_num
+            );
             if rc != CVI_RC_SUCCESS {
                 unsafe {
                     CVI_NN_CleanupModel(model);
@@ -216,10 +218,6 @@ mod imp {
             self.infer_timed(frame, config, None)
         }
 
-        pub fn input_dimensions(&self) -> (i32, i32) {
-            (self.input_w, self.input_h)
-        }
-
         pub fn infer_timed(
             &mut self,
             frame: &CameraFrame,
@@ -229,12 +227,13 @@ mod imp {
             let (input_ptr, input_len) = self.input_buffer()?;
             let input = unsafe { slice::from_raw_parts_mut(input_ptr, input_len) };
 
-            // Camera already delivers I422 planar at the model input size, so
-            // this is a plain color convert into the RGB planar tensor: no JPEG
-            // decode, no resize, no letterbox.
+            // Camera delivers I422 planar frames; yuv422p_to_rgb_planar handles
+            // color conversion, scaling, and letterbox padding to the model input size.
             let pre_start = Instant::now();
             image_bridge::yuv422p_to_rgb_planar(
                 &frame.pixels,
+                frame.width as i32,
+                frame.height as i32,
                 input,
                 self.input_w,
                 self.input_h,
@@ -250,38 +249,6 @@ mod imp {
                     decode_us: 0,
                     resize_us: preprocess_us,
                     preprocess_us,
-                    forward_us,
-                    postprocess_us,
-                };
-            }
-            Ok(detections)
-        }
-
-        pub fn infer_rgb_planar_timed(
-            &mut self,
-            rgb_planar: &[u8],
-            image_w: i32,
-            image_h: i32,
-            config: InferenceConfig,
-            mut timing: Option<&mut InferTiming>,
-        ) -> Result<Vec<Detection>, TpuError> {
-            let copy_start = Instant::now();
-            let (input_ptr, input_len) = self.input_buffer()?;
-            if rgb_planar.len() < input_len {
-                return Err(TpuError::new("RGB planar input buffer is too small"));
-            }
-            let input = unsafe { slice::from_raw_parts_mut(input_ptr, input_len) };
-            input.copy_from_slice(&rgb_planar[..input_len]);
-            let copy_us = copy_start.elapsed().as_micros() as i64;
-
-            let (detections, forward_us, postprocess_us) =
-                self.forward_and_detections(config, image_w, image_h)?;
-
-            if let Some(t) = timing.as_deref_mut() {
-                *t = InferTiming {
-                    decode_us: 0,
-                    resize_us: copy_us,
-                    preprocess_us: copy_us,
                     forward_us,
                     postprocess_us,
                 };
@@ -318,6 +285,10 @@ mod imp {
             image_w: i32,
             image_h: i32,
         ) -> Result<(Vec<Detection>, i64, i64), TpuError> {
+            eprintln!(
+                "[tpu] CVI_NN_Forward(model={:p}, inputs={:p}, input_num={}, outputs={:p}, output_num={}) ...",
+                self.model, self.inputs, self.input_num, self.outputs, self.output_num
+            );
             let fwd_start = Instant::now();
             let rc = unsafe {
                 CVI_NN_Forward(
@@ -329,12 +300,15 @@ mod imp {
                 )
             };
             let forward_us = fwd_start.elapsed().as_micros() as i64;
+            eprintln!("[tpu] CVI_NN_Forward → rc={} time={}us", rc, forward_us);
             if rc != CVI_RC_SUCCESS {
                 return Err(TpuError::new(format!("CVI_NN_Forward failed: {rc}")));
             }
 
+            eprintln!("[tpu] get_detections ...");
             let post_start = Instant::now();
             let mut detections = self.get_detections(config)?;
+            eprintln!("[tpu] get_detections → {} raw detections", detections.len());
             nms(&mut detections, config.iou_threshold);
             correct_yolo_boxes(
                 &mut detections,
@@ -357,13 +331,23 @@ mod imp {
             out_path: &Path,
             config: InferenceConfig,
         ) -> Result<Vec<Detection>, TpuError> {
+            eprintln!("[detect] step 1: getting input buffer ...");
             let (input_ptr, input_len) = self.input_buffer()?;
+            eprintln!(
+                "[detect] step 1 ok: input_ptr={:p} input_len={} input_w={} input_h={}",
+                input_ptr, input_len, self.input_w, self.input_h
+            );
             let input = unsafe { slice::from_raw_parts_mut(input_ptr, input_len) };
 
+            eprintln!("[detect] step 2: mjpeg_to_rgb_planar (image={} bytes) ...", image.len());
             let preprocess = self
                 .preprocessor
                 .mjpeg_to_rgb_planar(image, input, self.input_w, self.input_h)
                 .map_err(|err| TpuError::new(format!("MJPEG decode/preprocess failed: {err}")))?;
+            eprintln!(
+                "[detect] step 2 ok: src={}x{} decode={}us resize={}us",
+                preprocess.src_w, preprocess.src_h, preprocess.decode_us, preprocess.resize_us
+            );
 
             let image_w = if preprocess.src_w > 0 {
                 preprocess.src_w
@@ -375,10 +359,15 @@ mod imp {
             } else {
                 self.input_h
             };
-            let (detections, _, _) = self.forward_and_detections(config, image_w, image_h)?;
 
+            eprintln!("[detect] step 3: CVI_NN_Forward ...");
+            let (detections, _, _) = self.forward_and_detections(config, image_w, image_h)?;
+            eprintln!("[detect] step 3 ok: {} detections", detections.len());
+
+            eprintln!("[detect] step 4: draw_detections → {} ...", out_path.display());
             image_bridge::draw_detections(image, &detections, out_path)
                 .map_err(|err| TpuError::new(format!("failed to write annotated image: {err}")))?;
+            eprintln!("[detect] step 4 ok");
             Ok(detections)
         }
 
@@ -389,12 +378,18 @@ mod imp {
             let output = unsafe { &mut *self.outputs };
             let shape = self.output_shapes[0];
             let count = output.count;
+            eprintln!(
+                "[tpu] get_detections: output={:p} shape={:?} count={} fmt={} qscale={} zero_point={}",
+                output, shape, count, output.fmt, output.qscale, output.zero_point
+            );
             let ptr = unsafe { CVI_NN_TensorPtr(output as *mut CviTensor) };
+            eprintln!("[tpu] CVI_NN_TensorPtr → {:p}", ptr);
             if ptr.is_null() {
                 return Err(TpuError::new("output tensor pointer is null"));
             }
 
             let data = tensor_to_f32(output, ptr, count)?;
+            eprintln!("[tpu] tensor_to_f32 → {} elements", data.len());
             Ok(parse_yolov8_output(
                 &data,
                 [shape.dim[0], shape.dim[1], shape.dim[2], shape.dim[3]],
@@ -429,16 +424,23 @@ mod imp {
         ptr: *mut c_void,
         count: usize,
     ) -> Result<Vec<f32>, TpuError> {
+        eprintln!("[tpu] tensor_to_f32: fmt={} count={} ptr={:p}", tensor.fmt, count, ptr);
         match tensor.fmt {
             CVI_FMT_FP32 => {
+                eprintln!("[tpu] tensor_to_f32: FP32 path, reading {} f32s from {:p}", count, ptr);
                 let src = unsafe { slice::from_raw_parts(ptr as *const f32, count) };
                 Ok(src.to_vec())
             }
             CVI_FMT_INT8 => {
+                eprintln!("[tpu] tensor_to_f32: INT8 path, qscale={}", tensor.qscale);
                 let src = unsafe { slice::from_raw_parts(ptr as *const i8, count) };
                 Ok(src.iter().map(|v| *v as f32 * tensor.qscale).collect())
             }
             CVI_FMT_UINT8 => {
+                eprintln!(
+                    "[tpu] tensor_to_f32: UINT8 path, qscale={} zero_point={}",
+                    tensor.qscale, tensor.zero_point
+                );
                 let src = unsafe { slice::from_raw_parts(ptr as *const u8, count) };
                 Ok(src
                     .iter()
@@ -446,6 +448,7 @@ mod imp {
                     .collect())
             }
             CVI_FMT_BF16 => {
+                eprintln!("[tpu] tensor_to_f32: BF16 path");
                 let src = unsafe { slice::from_raw_parts(ptr as *const u16, count) };
                 Ok(src
                     .iter()
@@ -453,6 +456,7 @@ mod imp {
                     .collect())
             }
             CVI_FMT_INT16 => {
+                eprintln!("[tpu] tensor_to_f32: INT16 path, qscale={}", tensor.qscale);
                 let src = unsafe { slice::from_raw_parts(ptr as *const i16, count) };
                 Ok(src.iter().map(|v| *v as f32 * tensor.qscale).collect())
             }
@@ -487,26 +491,9 @@ mod imp {
             ))
         }
 
-        pub fn input_dimensions(&self) -> (i32, i32) {
-            (0, 0)
-        }
-
         pub fn infer_timed(
             &mut self,
             _frame: &CameraFrame,
-            _config: InferenceConfig,
-            _timing: Option<&mut InferTiming>,
-        ) -> Result<Vec<Detection>, TpuError> {
-            Err(TpuError::new(
-                "akars was built without SG2002 TPU runtime support",
-            ))
-        }
-
-        pub fn infer_rgb_planar_timed(
-            &mut self,
-            _rgb_planar: &[u8],
-            _image_w: i32,
-            _image_h: i32,
             _config: InferenceConfig,
             _timing: Option<&mut InferTiming>,
         ) -> Result<Vec<Detection>, TpuError> {

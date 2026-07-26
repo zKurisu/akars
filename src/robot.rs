@@ -1,7 +1,6 @@
 use crate::arm::Arm;
 use crate::camera::UsbCamera;
 use crate::detector::Detection;
-use crate::image_bridge;
 use crate::motor::Motor;
 use crate::tpu::{InferTiming, InferenceConfig, YoloModel};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,8 +36,6 @@ struct RobotState {
     area_ratio: f32,
     ball_cx: i32,
     grab_confirm_count: i32,
-    // 连续漏检帧数;在宽限期内先保持不动等球重现,超过阈值才判定真丢并搜索。
-    miss_count: i32,
 }
 
 impl Default for RobotState {
@@ -48,59 +45,27 @@ impl Default for RobotState {
             area_ratio: 0.0,
             ball_cx: 0,
             grab_confirm_count: 0,
-            miss_count: 0,
         }
     }
 }
 
-// 参考帧宽度。像素类阈值(如中心死区)以此为基准按分辨率缩放,保证不同分辨率下行为一致。
 const REFERENCE_FRAME_WIDTH: f32 = 640.0;
-// 基础中心死区(像素,基于 640 宽)。球中心偏离画面中心在此范围内即视为“已居中”,不再转向,避免对着中心反复微调。
-const CENTER_MARGIN: i32 = 50;
-// 转向脉冲正比于“居中误差”(offset),而非距离。
-// 偏差达到半屏时对应 TURN_PULSE_GAIN_US;偏差越小脉冲越短(趋向 TURN_PULSE_MIN_US),让对准收敛而不是来回摆。
-const TURN_PULSE_GAIN_US: f32 = 250_000.0;
-// 接近阻尼下限。相机装在旋转中心前方,原地旋转时越近的球在画面里划过越快;
-// 阻尼系数 = clamp(1 - area_ratio, 此值, 1),球越大(越近)脉冲压得越小,消除近距离的过冲/摇头。
-const PROXIMITY_DAMP_MIN: f32 = 0.35;
-// 中心死区随接近放大的系数。有效死区 = CENTER_MARGIN × (1 + 此值 × area_ratio);
-// 抓球前不再追求亚像素级居中(抓取自带左转补偿),近处放宽容差直接消除小幅 hunting。
-const MARGIN_PROXIMITY_GAIN: f32 = 2.0;
-
-// 球框面积占画面比 ≥ 此值 → 认为“够近可抓”,是触发抓取的主要距离阈值。
-const GRAB_AREA: f32 = 0.40;
-// 面积比 ≥ 此值 → “太近了”,先后退一点再抓,避免撞飞球。必须 > GRAB_AREA。
-const GRAB_AREA_MAX: f32 = 0.55;
-
-// 抓取前小幅左转微调的次数(补偿爪子相对相机的安装偏心,把球挪到爪子正前方)。
-const GRAB_LEFT_TURN_COUNT: i32 = 2;
-// 连续满足“够近且居中”的帧数达到此值才真正执行抓取,防单帧误检导致误抓。
-const GRAB_CONFIRM_THRESHOLD: i32 = 5;
-// 丢失宽限帧数。看到过球后若漏检,先原地保持不动等它重现,连续漏检超过此值才判定真丢并开始搜索,
-// 避免转向时的偶发漏检(运动模糊/擦边)立刻触发盲搜把球搞丢。
-const LOST_GRACE_FRAMES: i32 = 8;
-
-// 已居中但还没够近时的直线追球速度(1–100 等级,经 motor 死区映射后转 PWM)。
-const CHASE_SPEED: i32 = 20;
-// 原地转向对准速度。太小转不动,太大转过头。
-const TURN_SPEED: i32 = 22;
-// 没检测到球时原地慢转搜索的速度。
-const IDLE_SPEED: i32 = 18;
-// 抓取前左转微调的速度。
-const GRAB_LEFT_TURN_SPEED: i32 = 18;
-// 太近(≥ GRAB_AREA_MAX)时的后退速度。
-const BACKWARD_SPEED: i32 = 18;
-
-// 单次转向的最长时长上限,防大偏差时猛甩过头。
-const TURN_PULSE_MAX_US: u64 = 250_000;
-// 单次转向的最短时长下限。短于此电机来不及克服静摩擦(“转不动”),故设地板。
-const TURN_PULSE_MIN_US: u64 = 55_000;
-// 对准脉冲后的静置时长,让轮子停稳再取下一帧,减少运动模糊导致的漏检。
-const ALIGN_SETTLE_US: u64 = 60_000;
-// 太近时后退的时长。
-const BACKWARD_PULSE_US: u64 = 200_000;
-// 抓取前每次左转微调的时长。
-const GRAB_LEFT_TURN_US: u64 = 250_000;
+/// Ball area ratio at which the robot should stop and grab.
+/// ~0.55 = ball fills the screen top-to-bottom at 640×480.
+const GRAB_AREA: f32 = 0.55;
+const CENTER_MARGIN: i32 = 35;
+const K_TURN_PULSE: f32 = 2500.0;
+const TURN_PULSE_MAX_US: u64 = 120_000;
+/// Only back up if the ball literally fills nearly the whole frame.
+const GRAB_AREA_MAX: f32 = 0.85;
+const CHASE_SPEED: i32 = 56;
+const TURN_SPEED: i32 = 10;
+const IDLE_SPEED: i32 = 8;
+const SEARCH_PULSE_US: u64 = 200_000;
+const TURN_PULSE_MIN_US: u64 = 25_000;
+const GRAB_CONFIRM_THRESHOLD: i32 = 2;
+const BACKWARD_SPEED: i32 = 16;
+const BACKWARD_PULSE_US: u64 = 80_000;
 
 pub fn install_signal_handlers() {
     unsafe {
@@ -125,95 +90,134 @@ pub fn run_tennis_hunter(
     config: RobotConfig,
 ) {
     let mut robot = RobotState::default();
+    let mut frame_idx = 0u64;
     let mut total_time = Duration::ZERO;
     let mut frame_count = 0u64;
-    let mut frame_idx = 0u64;
-    let (model_w, model_h) = model.input_dimensions();
-    let rgb_len = (model_w as usize)
-        .checked_mul(model_h as usize)
-        .and_then(|pixels| pixels.checked_mul(3))
-        .unwrap_or(0);
-    if rgb_len == 0 {
-        eprintln!("[camera] invalid model input size: {}x{}", model_w, model_h);
-        motor.standby();
-        return;
-    }
-    let mut rgb_planar = vec![0u8; rgb_len];
+    let mut camera_errors = 0u32;
+    // Recovery tier: 0=not tried yet, 1=re_init tried, 2=reopen tried,
+    // 3=hard_reset tried.
+    let mut camera_recoveries = 0u32;
 
+    arm.restore_torque(0);
+    sleep_us(50_000);
+    arm.restore_torque(1);
+    sleep_us(50_000);
+    arm.restore_torque(2);
+    sleep_us(50_000);
     arm.grab_pos();
 
+    eprintln!(
+        "[cfg] GRAB_AREA={:.3} GRAB_AREA_MAX={:.3} \
+         CHASE_SPEED={CHASE_SPEED} CONFIRM={GRAB_CONFIRM_THRESHOLD} \
+         IDLE={IDLE_SPEED} SEARCH_PULSE={}ms CENTER_MARGIN={CENTER_MARGIN} \
+         TURN_PULSE=[{TURN_PULSE_MIN_US}..{TURN_PULSE_MAX_US}]us",
+        GRAB_AREA, GRAB_AREA_MAX, SEARCH_PULSE_US / 1000,
+    );
+
     while !stop_requested() {
-        if let Some(limit) = config.max_frames {
-            if frame_idx >= limit {
+        if let Some(max_frames) = config.max_frames {
+            if frame_idx >= max_frames {
                 break;
             }
         }
 
+        let frame_start = Instant::now();
         frame_idx += 1;
 
         let capture_start = Instant::now();
         let frame = match camera.get_frame() {
-            Ok(frame) => frame,
+            Ok(frame) => {
+                camera_errors = 0;
+                camera_recoveries = 0;
+                frame
+            }
             Err(err) => {
-                eprintln!("[camera] failed to get frame: {err}");
+                camera_errors += 1;
+                eprintln!("[camera] failed to get frame (#{camera_errors}): {err}");
+                if camera_errors >= 3 {
+                    camera_recoveries += 1;
+                    if camera_recoveries == 1 {
+                        // Tier 1: INIT resets session and re-initializes.
+                        eprintln!(
+                            "[camera] {} consecutive errors, re-initializing ...",
+                            camera_errors
+                        );
+                        if let Err(e) = camera.re_init() {
+                            eprintln!("[camera] re-init failed: {e}");
+                            sleep_us(500_000);
+                        } else {
+                            eprintln!("[camera] re-init ok");
+                            camera_errors = 0;
+                        }
+                    } else if camera_recoveries == 2 {
+                        // Tier 2: close fd + reopen + INIT (close now clears session).
+                        eprintln!("[camera] re-init didn't help, closing and reopening device ...");
+                        match camera.reopen() {
+                            Ok(()) => {
+                                eprintln!("[camera] reopen ok");
+                                camera_errors = 0;
+                            }
+                            Err(e) => {
+                                eprintln!("[camera] reopen failed: {e}");
+                                sleep_us(500_000);
+                            }
+                        }
+                    } else {
+                        // Tier 3: VBUS power-cycle (~2.5 s), the strongest recovery.
+                        eprintln!("[camera] reopen didn't help, power-cycling camera VBUS ...");
+                        match camera.hard_reset() {
+                            Ok(()) => {
+                                eprintln!("[camera] hard-reset ok");
+                                camera_errors = 0;
+                                camera_recoveries = 0;
+                            }
+                            Err(e) => {
+                                eprintln!("[camera] hard-reset also failed: {e}");
+                                sleep_us(1_000_000);
+                            }
+                        }
+                    }
+                }
                 sleep_us(100_000);
                 continue;
             }
         };
         let capture_us = capture_start.elapsed().as_micros() as i64;
 
-        let preprocess_start = Instant::now();
-        if let Err(err) =
-            image_bridge::yuv422p_to_rgb_planar(&frame.pixels, &mut rgb_planar, model_w, model_h)
-        {
-            eprintln!("[pre] YUV preprocess failed: {err}");
-            continue;
-        }
-        let preprocess_us = preprocess_start.elapsed().as_micros() as i64;
-
-        let image_w = frame.width as i32;
-        let image_h = frame.height as i32;
         let mut timing = InferTiming::default();
-        let detections = match model.infer_rgb_planar_timed(
-            &rgb_planar,
-            image_w,
-            image_h,
-            config.inference,
-            Some(&mut timing),
-        ) {
+        let detections = match model.infer_timed(&frame, config.inference, Some(&mut timing)) {
             Ok(detections) => detections,
             Err(err) => {
                 eprintln!("[detect] inference failed: {err}");
+                sleep_us(100_000);
                 continue;
             }
         };
 
-        eprintln!(
-            "[time] frame={} capture={:.1} pre={:.1} fwd={:.1} post={:.1} ms",
-            frame_idx,
-            capture_us as f32 / 1000.0,
-            preprocess_us as f32 / 1000.0,
-            timing.forward_us as f32 / 1000.0,
-            timing.postprocess_us as f32 / 1000.0,
-        );
-
-        let control_start = Instant::now();
+        let handle_start = Instant::now();
         handle_detections(
             &detections,
-            image_w,
-            image_h,
+            frame.width as i32,
+            frame.height as i32,
             &mut robot,
             &mut motor,
             &mut arm,
         );
+        let handle_us = handle_start.elapsed().as_micros() as i64;
 
-        let control_time = control_start.elapsed();
-        let frame_time = Duration::from_micros(
-            capture_us.max(0) as u64
-                + preprocess_us.max(0) as u64
-                + timing.forward_us.max(0) as u64
-                + timing.postprocess_us.max(0) as u64,
-        ) + control_time;
+        let frame_time = frame_start.elapsed();
+
+        eprintln!(
+            "[time] cap={:.1} pre={:.1}(dec={:.1} rsz={:.1}) fwd={:.1} post={:.1} handle={:.1} total={:.1} ms",
+            capture_us as f32 / 1000.0,
+            timing.preprocess_us as f32 / 1000.0,
+            timing.decode_us as f32 / 1000.0,
+            timing.resize_us as f32 / 1000.0,
+            timing.forward_us as f32 / 1000.0,
+            timing.postprocess_us as f32 / 1000.0,
+            handle_us as f32 / 1000.0,
+            frame_time.as_secs_f32() * 1000.0,
+        );
         total_time += frame_time;
         frame_count += 1;
         let fps = if frame_time.as_secs_f32() > 0.0 {
@@ -226,12 +230,15 @@ pub fn run_tennis_hunter(
         } else {
             0.0
         };
-        println!(
-            "[FPS] {:.2} avg: {:.2} ({:.1}ms, control={:.1}ms)",
+        eprintln!(
+            "[FPS] {:.2} avg: {:.2} ({:.1}ms) status={:?} area={:.3} cx={} confirm={}",
             fps,
             avg_fps,
             frame_time.as_secs_f32() * 1000.0,
-            control_time.as_secs_f32() * 1000.0
+            robot.status,
+            robot.area_ratio,
+            robot.ball_cx,
+            robot.grab_confirm_count,
         );
     }
 
@@ -247,31 +254,25 @@ fn handle_detections(
     arm: &mut Arm,
 ) {
     if detections.is_empty() {
-        robot.grab_confirm_count = 0;
-        robot.miss_count += 1;
-
-        if robot.miss_count <= LOST_GRACE_FRAMES {
-            // 宽限期内:刚才还看得到球,先停住等它重现,别急着盲搜。
-            eprintln!(
-                "[detect] missed {}/{} frames, holding",
-                robot.miss_count, LOST_GRACE_FRAMES
-            );
+        eprintln!("[detect] no ball detected, searching");
+        if robot.grab_confirm_count > 0 {
+            // Ball disappeared while we were approaching — it may be directly
+            // under the camera.  Back up a little before resuming search.
+            eprintln!("[detect] lost ball during approach, backing up");
+            motor.backward(BACKWARD_SPEED);
+            sleep_us(BACKWARD_PULSE_US);
             motor.standby();
-        } else {
-            // 真丢了:朝球最后出现的一侧转,而不是固定方向盲搜。
-            robot.status = RobotStatus::ChaseTennis;
-            let last_offset = robot.ball_cx - image_w / 2;
-            if last_offset >= 0 {
-                eprintln!("[detect] ball lost, searching right (last seen right)");
-                motor.drive(IDLE_SPEED, -IDLE_SPEED);
-            } else {
-                eprintln!("[detect] ball lost, searching left (last seen left)");
-                motor.drive(-IDLE_SPEED, IDLE_SPEED);
-            }
         }
+        robot.grab_confirm_count = 0;
+        robot.status = RobotStatus::ChaseTennis;
+        // Turn for a fixed pulse then stop so the camera gets an un-blurred
+        // view next frame, but the pulse is long enough (600 ms) to produce
+        // useful rotation even at slow frame rates.
+        motor.drive(IDLE_SPEED, -IDLE_SPEED);
+        sleep_us(SEARCH_PULSE_US);
+        motor.standby();
         return;
     }
-    robot.miss_count = 0;
 
     let best = detections
         .iter()
@@ -286,10 +287,10 @@ fn handle_detections(
     let area_ratio = (best.bbox.w * best.bbox.h) / image_area;
     let ball_cx = best.bbox.x as i32;
     let center = image_w / 2;
-    let center_margin = proximity_center_margin(image_w, area_ratio);
+    let center_margin = scaled_center_margin(image_w);
     let offset = ball_cx - center;
     let centered = offset.abs() <= center_margin;
-    let pulse_us = turn_pulse_us(offset, image_w, area_ratio);
+    let pulse_us = turn_pulse_us(area_ratio);
 
     robot.area_ratio = area_ratio;
     robot.ball_cx = ball_cx;
@@ -300,13 +301,15 @@ fn handle_detections(
     );
 
     if area_ratio >= GRAB_AREA && centered {
+        // ── Ball fills the screen: stop and grab ──
         robot.status = RobotStatus::GrabTennis;
         robot.grab_confirm_count += 1;
 
         if area_ratio >= GRAB_AREA_MAX {
-            eprintln!("[grab] too close, backing up");
+            // Extremely close — gentle nudge back, then grab.
+            eprintln!("[grab] too close (area={area_ratio:.3}), nudging back");
             motor.backward(BACKWARD_SPEED);
-            sleep_us(BACKWARD_PULSE_US);
+            sleep_us(BACKWARD_PULSE_US / 2);
             motor.standby();
         } else {
             motor.standby();
@@ -315,39 +318,50 @@ fn handle_detections(
         if robot.grab_confirm_count >= GRAB_CONFIRM_THRESHOLD {
             if area_ratio >= GRAB_AREA_MAX {
                 motor.backward(BACKWARD_SPEED);
-                sleep_us(BACKWARD_PULSE_US);
+                sleep_us(BACKWARD_PULSE_US / 2);
                 motor.standby();
             }
 
-            for _ in 0..GRAB_LEFT_TURN_COUNT {
-                motor.drive(-GRAB_LEFT_TURN_SPEED, GRAB_LEFT_TURN_SPEED);
-                sleep_us(GRAB_LEFT_TURN_US);
-                motor.standby();
-                sleep_us(100_000);
-            }
-
+            eprintln!("[grab] executing grab sequence");
             arm.grab();
-            sleep_us(2_000_00);
+            sleep_us(2_000_000);
             arm.release();
-            sleep_us(1_000_00);
+            sleep_us(1_000_000);
             arm.grab_pos();
-            sleep_us(1_000_00);
+            sleep_us(1_000_000);
 
             robot.grab_confirm_count = 0;
             robot.status = RobotStatus::ChaseTennis;
         }
     } else if area_ratio >= GRAB_AREA && !centered {
-        robot.grab_confirm_count = 0;
+        // Big but off-centre — align to centre the ball, keep progress.
         align(offset, pulse_us, motor);
     } else {
+        // Ball is still far — chase.
         robot.grab_confirm_count = 0;
         robot.status = RobotStatus::ChaseTennis;
         if centered {
-            motor.forward(CHASE_SPEED);
+            motor.forward(chase_speed(area_ratio));
         } else {
             align(offset, pulse_us, motor);
         }
     }
+}
+
+/// Progressively reduce forward speed as the target gets larger in frame.
+/// Keeps full CHASE_SPEED when the ball is very small (&lt; 15% of frame),
+/// then linearly ramps down to a creep speed near GRAB_AREA.
+fn chase_speed(area_ratio: f32) -> i32 {
+    if area_ratio >= GRAB_AREA {
+        return 0; // close enough — stop
+    }
+    if area_ratio < 0.20 {
+        return CHASE_SPEED; // far away: full speed 56
+    }
+    // 20 % → GRAB_AREA (55 %): linear ramp 56 → 8
+    let t = (area_ratio - 0.20) / (GRAB_AREA - 0.20);
+    let speed = CHASE_SPEED as f32 * (1.0 - t) + 8.0 * t;
+    speed.round().max(1.0) as i32
 }
 
 fn align(offset: i32, pulse_us: u64, motor: &mut Motor) {
@@ -358,8 +372,6 @@ fn align(offset: i32, pulse_us: u64, motor: &mut Motor) {
     }
     sleep_us(pulse_us);
     motor.standby();
-    // 等轮子停稳再让主循环取下一帧,避免运动模糊导致漏检丢球。
-    sleep_us(ALIGN_SETTLE_US);
 }
 
 fn scaled_center_margin(image_w: i32) -> i32 {
@@ -368,19 +380,8 @@ fn scaled_center_margin(image_w: i32) -> i32 {
         .max(1.0) as i32
 }
 
-fn proximity_center_margin(image_w: i32, area_ratio: f32) -> i32 {
-    let base = scaled_center_margin(image_w) as f32;
-    (base * (1.0 + MARGIN_PROXIMITY_GAIN * area_ratio.max(0.0)))
-        .round()
-        .max(1.0) as i32
-}
-
-fn turn_pulse_us(offset: i32, image_w: i32, area_ratio: f32) -> u64 {
-    let half_width = (image_w / 2).max(1) as f32;
-    let norm_offset = (offset.abs() as f32 / half_width).min(1.0);
-    let proximity_damp = (1.0 - area_ratio).clamp(PROXIMITY_DAMP_MIN, 1.0);
-    ((TURN_PULSE_GAIN_US * norm_offset * proximity_damp) as u64)
-        .clamp(TURN_PULSE_MIN_US, TURN_PULSE_MAX_US)
+fn turn_pulse_us(area_ratio: f32) -> u64 {
+    ((K_TURN_PULSE * area_ratio * 1000.0) as u64).clamp(TURN_PULSE_MIN_US, TURN_PULSE_MAX_US)
 }
 
 fn sleep_us(us: u64) {
@@ -389,34 +390,17 @@ fn sleep_us(us: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        proximity_center_margin, scaled_center_margin, turn_pulse_us, TURN_PULSE_MAX_US,
-        TURN_PULSE_MIN_US,
-    };
+    use super::{scaled_center_margin, turn_pulse_us, TURN_PULSE_MAX_US, TURN_PULSE_MIN_US};
 
     #[test]
     fn scales_center_margin() {
-        assert_eq!(scaled_center_margin(640), 50);
-        assert_eq!(scaled_center_margin(320), 25);
-    }
-
-    #[test]
-    fn margin_widens_with_proximity() {
-        // Far away (tiny ball) stays near the base margin.
-        assert_eq!(proximity_center_margin(640, 0.0), 50);
-        // Close up (big ball) widens the dead zone to stop hunting.
-        assert!(proximity_center_margin(640, 0.4) > scaled_center_margin(640));
+        assert_eq!(scaled_center_margin(640), 35);
+        assert_eq!(scaled_center_margin(320), 18);
     }
 
     #[test]
     fn clamps_turn_pulse() {
-        // Zero offset floors to the minimum step.
-        assert_eq!(turn_pulse_us(0, 640, 0.0), TURN_PULSE_MIN_US);
-        // A full half-frame offset saturates to the maximum.
-        assert_eq!(turn_pulse_us(1000, 640, 0.0), TURN_PULSE_MAX_US);
-        // A larger offset yields a longer pulse than a smaller one.
-        assert!(turn_pulse_us(160, 640, 0.0) > turn_pulse_us(60, 640, 0.0));
-        // A nearby ball (large area) is damped below the same offset far away.
-        assert!(turn_pulse_us(160, 640, 0.5) < turn_pulse_us(160, 640, 0.0));
+        assert_eq!(turn_pulse_us(0.0), TURN_PULSE_MIN_US);
+        assert_eq!(turn_pulse_us(100.0), TURN_PULSE_MAX_US);
     }
 }

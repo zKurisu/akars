@@ -14,16 +14,18 @@ pub struct SerialPort {
 
 impl SerialPort {
     pub fn open<P: AsRef<Path>>(path: P, baudrate: i32, nonblocking: bool) -> io::Result<Self> {
-        let mut flags = linux::O_NOCTTY;
+        let path_ref = path.as_ref();
+        let path_str = path_ref.to_string_lossy().to_string();
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.read(true).write(true);
         if nonblocking {
-            flags |= linux::O_NONBLOCK;
+            open_opts.custom_flags(linux::O_NONBLOCK);
         }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(flags)
-            .open(path)?;
+        eprintln!("[serial] opening {} (baud={baudrate}, nonblocking={nonblocking}) ...", path_str);
+        let file = open_opts.open(path_ref)?;
+        eprintln!("[serial] {} opened, configuring ...", path_str);
         configure(file.as_raw_fd(), baudrate)?;
+        eprintln!("[serial] {} configured ok", path_str);
         Ok(Self { file })
     }
 

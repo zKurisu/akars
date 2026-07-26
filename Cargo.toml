@@ -11,5 +11,53 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 zune-core = "0.5"
 zune-jpeg = "0.5"
 
+[[bin]]
+name = "arm_test"
+path = "src/bin/arm_test.rs"
+
+[[bin]]
+name = "motor_test"
+path = "src/bin/motor_test.rs"
+
+[[bin]]
+name = "camera_test"
+path = "src/bin/camera_test.rs"
+
+[[bin]]
+name = "hello"
+path = "src/bin/hello.rs"
+
+[[bin]]
+name = "test_servo0_lift"
+path = "src/bin/test_servo0_lift.rs"
+
+[[bin]]
+name = "test_servo0_prepare"
+path = "src/bin/test_servo0_prepare.rs"
+
+[[bin]]
+name = "test_servo1_lift"
+path = "src/bin/test_servo1_lift.rs"
+
+[[bin]]
+name = "test_servo1_prepare"
+path = "src/bin/test_servo1_prepare.rs"
+
+[[bin]]
+name = "test_servo2_approach"
+path = "src/bin/test_servo2_approach.rs"
+
+[[bin]]
+name = "test_servo2_grab"
+path = "src/bin/test_servo2_grab.rs"
+
+[[bin]]
+name = "test_servo2_lift"
+path = "src/bin/test_servo2_lift.rs"
+
+[[bin]]
+name = "test_servo2_prepare"
+path = "src/bin/test_servo2_prepare.rs"
+
 [profile.release]
 lto = "thin"
