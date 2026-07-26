@@ -202,6 +202,7 @@ pub fn run_tennis_hunter(
             &mut robot,
             &mut motor,
             &mut arm,
+            &mut camera,
         );
         let handle_us = handle_start.elapsed().as_micros() as i64;
 
@@ -252,6 +253,7 @@ fn handle_detections(
     robot: &mut RobotState,
     motor: &mut Motor,
     arm: &mut Arm,
+    camera: &mut UsbCamera,
 ) {
     if detections.is_empty() {
         eprintln!("[detect] no ball detected, searching");
@@ -332,6 +334,12 @@ fn handle_detections(
 
             robot.grab_confirm_count = 0;
             robot.status = RobotStatus::ChaseTennis;
+
+            // Grab took ~11 s — the camera pipeline likely timed out.
+            // Reset it so the next capture doesn't get EIO.
+            if let Err(e) = camera.re_init() {
+                eprintln!("[camera] re-init after grab failed: {e}");
+            }
         }
     } else if area_ratio >= GRAB_AREA && !centered {
         // Big but off-centre — align to centre the ball, keep progress.
