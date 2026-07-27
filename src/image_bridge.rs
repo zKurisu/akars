@@ -718,17 +718,38 @@ fn glyph_rows(ch: char) -> [u8; FONT_HEIGHT as usize] {
 }
 
 fn save_rgb_image(image: &RgbImage, out_path: &Path) -> Result<(), ImageBridgeError> {
+    eprintln!("[save] step 1: format from path ...");
     let format = ImageFormat::from_path(out_path).map_err(ImageBridgeError::Save)?;
+    eprintln!("[save] step 1 ok: format={format:?}");
     if format == ImageFormat::Jpeg {
-        let file = File::create(out_path).map_err(ImageBridgeError::Io)?;
-        JpegEncoder::new_with_quality(file, 95)
-            .encode(
-                image.as_raw(),
-                image.width(),
-                image.height(),
-                ExtendedColorType::Rgb8,
-            )
-            .map_err(ImageBridgeError::Save)?;
+        eprintln!("[save] step 2: File::create ...");
+        let mut file = File::create(out_path).map_err(ImageBridgeError::Io)?;
+        eprintln!("[save] step 2 ok");
+        eprintln!("[save] step 3: JPEG encode to memory buffer {}x{} ...", image.width(), image.height());
+        let encode_start = Instant::now();
+
+        // Encode to a memory buffer first to separate compute time from I/O time.
+        let mut jpeg_buf = Vec::new();
+        {
+            let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, 95);
+            encoder
+                .encode(
+                    image.as_raw(),
+                    image.width(),
+                    image.height(),
+                    ExtendedColorType::Rgb8,
+                )
+                .map_err(ImageBridgeError::Save)?;
+        }
+        let encode_elapsed = encode_start.elapsed().as_micros();
+        let jpeg_size = jpeg_buf.len();
+        eprintln!("[save] step 3 ok: JPEG encode took {}us, produced {} bytes", encode_elapsed, jpeg_size);
+
+        eprintln!("[save] step 4: writing {} bytes to file ...", jpeg_size);
+        let write_start = Instant::now();
+        use std::io::Write;
+        file.write_all(&jpeg_buf).map_err(ImageBridgeError::Io)?;
+        eprintln!("[save] step 4 ok: file write took {}us", write_start.elapsed().as_micros());
         return Ok(());
     }
     DynamicImage::ImageRgb8(image.clone())
