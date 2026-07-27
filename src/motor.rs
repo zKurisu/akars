@@ -27,8 +27,8 @@ pub struct MotorConfig {
 impl Default for MotorConfig {
     fn default() -> Self {
         Self {
-            device: "/dev/ttyS3".to_string(),
-            speed_scale: 150,
+            device: "/dev/ttyS1".to_string(),
+            speed_scale: 85,
             ppr: 4680,
             pwm_freq: 20000,
             min_speed: 15,

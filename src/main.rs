@@ -42,12 +42,23 @@ struct CaptureCli {
     warmup: u32,
 }
 
+/// Arguments for manual arm debugging: set all three servo angles directly.
+#[derive(Debug)]
+struct ArmTestCli {
+    arm: String,
+    servo0: f32,
+    servo1: f32,
+    servo2: f32,
+    time_ms: i32,
+}
+
 #[derive(Debug)]
 enum Command {
     Hunt(Cli),
     Serve(WebConfig),
     Detect(DetectCli),
     Capture(CaptureCli),
+    ArmTest(ArmTestCli),
 }
 
 impl Default for Cli {
@@ -88,6 +99,18 @@ impl Default for CaptureCli {
     }
 }
 
+impl Default for ArmTestCli {
+    fn default() -> Self {
+        Self {
+            arm: "/dev/ttyS2".to_string(),
+            servo0: 0.0,
+            servo1: 0.0,
+            servo2: 0.0,
+            time_ms: 1000,
+        }
+    }
+}
+
 fn main() {
     let command = match parse_cli(env::args().skip(1)) {
         Ok(command) => command,
@@ -115,7 +138,28 @@ fn main() {
         }
         Command::Detect(cli) => run_detect(cli),
         Command::Capture(cli) => run_capture(cli),
+        Command::ArmTest(cli) => run_armtest(cli),
     }
+}
+
+fn run_armtest(cli: ArmTestCli) {
+    let mut arm = match Arm::open(&cli.arm, 115200) {
+        Ok(arm) => arm,
+        Err(err) => {
+            eprintln!("[armtest] failed to open {}: {err}", cli.arm);
+            std::process::exit(1);
+        }
+    };
+
+    let time_ms = cli.time_ms.clamp(0, 10_000);
+    arm.set_angle(0, cli.servo0, time_ms);
+    arm.set_angle(1, cli.servo1, time_ms);
+    arm.set_angle(2, cli.servo2, time_ms);
+
+    eprintln!(
+        "[armtest] sent: servo0={:.1} servo1={:.1} servo2={:.1} time_ms={}",
+        cli.servo0, cli.servo1, cli.servo2, time_ms
+    );
 }
 
 fn run_hunt(cli: Cli) {
@@ -294,8 +338,56 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Command, String> {
             args.next();
             parse_capture_cli(args).map(Command::Capture)
         }
+        Some("armtest") => {
+            args.next();
+            parse_armtest_cli(args).map(Command::ArmTest)
+        }
         _ => parse_hunt_cli(args).map(Command::Hunt),
     }
+}
+
+fn parse_armtest_cli(args: impl Iterator<Item = String>) -> Result<ArmTestCli, String> {
+    let mut cli = ArmTestCli::default();
+    let mut args = args.peekable();
+    let mut positional: Vec<f32> = Vec::with_capacity(3);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_armtest_usage();
+                std::process::exit(0);
+            }
+            "--arm" => cli.arm = take_value(&mut args, "--arm")?,
+            "--time" => {
+                cli.time_ms = take_value(&mut args, "--time")?
+                    .parse()
+                    .map_err(|_| "--time expects an integer (ms)".to_string())?;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown armtest option: {value}"))
+            }
+            value => {
+                if positional.len() >= 3 {
+                    return Err(format!("unexpected armtest argument: {value}"));
+                }
+                let angle = value
+                    .parse::<f32>()
+                    .map_err(|_| format!("invalid angle value: {value}"))?;
+                positional.push(angle);
+            }
+        }
+    }
+
+    if positional.len() != 3 {
+        return Err(
+            "armtest expects exactly 3 angle arguments: <servo0> <servo1> <servo2>".to_string(),
+        );
+    }
+
+    cli.servo0 = positional[0];
+    cli.servo1 = positional[1];
+    cli.servo2 = positional[2];
+    Ok(cli)
 }
 
 fn parse_hunt_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
@@ -468,7 +560,7 @@ fn take_value(
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  akars <model.cvimodel> [--camera DEV] [--motor DEV] [--arm DEV] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]"
+        "Usage:\n  akars <model.cvimodel> [--camera DEV] [--motor DEV] [--arm DEV] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n  akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS]"
     );
 }
 
@@ -487,5 +579,11 @@ fn print_detect_usage() {
 fn print_web_usage() {
     eprintln!(
         "Usage: akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n\nDefaults:\n  --listen 0.0.0.0:8080\n  --motor /dev/ttyS3\n  --arm /dev/ttyS2"
+    );
+}
+
+fn print_armtest_usage() {
+    eprintln!(
+        "Usage: akars armtest <servo0> <servo1> <servo2> [--arm DEV] [--time MS]\n\nSets three arm servo angles directly for debugging.\n\nDefaults:\n  --arm /dev/ttyS2\n  --time 1000"
     );
 }

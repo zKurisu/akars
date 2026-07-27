@@ -3,17 +3,17 @@ use std::io;
 use std::thread;
 use std::time::Duration;
 
-const ID2_ANGLE_OPEN: f32 = 110.0;
-const ID2_ANGLE_CLOSE: f32 = 50.0;
+const ID2_ANGLE_OPEN: f32 = 140.0;
+const ID2_ANGLE_CLOSE: f32 = 90.0;
 const ANGLE_MAX: f32 = 270.0;
 const PULSE_MIN: i32 = 500;
 const PULSE_MAX: i32 = 2500;
 
-const SERVO0_READY: f32 = 150.0;
-const SERVO1_READY: f32 = 100.0;
-const SERVO0_GRAB: f32 = 225.0;
-const SERVO1_GRAB: f32 = 60.0;
-const SERVO0_LIFT: f32 = 150.0;
+const SERVO0_READY: f32 = 180.0;
+const SERVO1_READY: f32 = 185.0;
+const SERVO0_GRAB: f32 = 245.0;
+const SERVO1_GRAB: f32 = 185.0;
+const SERVO0_LIFT: f32 = 180.0;
 const SERVO1_LIFT: f32 = 100.0;
 
 pub struct Arm {
@@ -22,6 +22,7 @@ pub struct Arm {
 
 impl Arm {
     pub fn open(device: &str, baudrate: i32) -> io::Result<Self> {
+        crate::pinmux::configure_for_device(device);
         Ok(Self {
             port: SerialPort::open(device, baudrate, false)?,
         })
@@ -56,8 +57,8 @@ impl Arm {
     }
 
     pub fn release_pos(&mut self) {
-        self.set_angle(0, SERVO0_GRAB, 1000);
-        self.set_angle(1, SERVO1_GRAB, 1000);
+        self.set_angle(0, SERVO0_READY, 1000);
+        self.set_angle(1, SERVO1_READY, 1000);
         self.set_angle(2, ID2_ANGLE_OPEN, 1000);
     }
 
