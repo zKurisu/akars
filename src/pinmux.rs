@@ -23,6 +23,11 @@ const FMUX_JTAG_CPU_TMS: u32 = 0x64;
 const FMUX_JTAG_CPU_TCK: u32 = 0x68;
 const FSEL_UART1: u32 = 6;
 
+// UART2 TX/RX on the IIC0_SCL / IIC0_SDA pads (FSEL=2).
+const FMUX_IIC0_SCL: u32 = 0x70;
+const FMUX_IIC0_SDA: u32 = 0x74;
+const FSEL_UART2: u32 = 2;
+
 /// Write one FMUX register through `/dev/pinmux` using its text interface.
 ///
 /// The whole `"0xOFFSET VALUE"` line must reach the device in a single write:
@@ -46,14 +51,27 @@ pub fn configure_uart1() -> io::Result<()> {
     Ok(())
 }
 
+/// Route the IIC0 pads to UART2 TX/RX so `/dev/ttyS2` can drive the arm servo
+/// controller. The IIC0 bus becomes unavailable after this.
+pub fn configure_uart2() -> io::Result<()> {
+    write_fmux(FMUX_IIC0_SCL, FSEL_UART2)?;
+    write_fmux(FMUX_IIC0_SDA, FSEL_UART2)?;
+    Ok(())
+}
+
 /// Configure pin-mux for whichever UART backs `device`, based on the `ttySN`
-/// alias. Only UART1 (`ttyS1`) is wired on this board; other ports are left
-/// untouched with a warning so a mistargeted `--motor` path is visible.
+/// alias. UART1 (`ttyS1`) and UART2 (`ttyS2`) are handled; other ports are
+/// left untouched with a warning so a mistargeted path is visible.
 pub fn configure_for_device(device: &str) {
     if device.ends_with("ttyS1") {
         match configure_uart1() {
             Ok(()) => eprintln!("[pinmux] UART1 pads routed (JTAG TMS/TCK -> UART1 TX/RX)"),
             Err(err) => eprintln!("[pinmux] failed to configure UART1 via {PINMUX_DEVICE}: {err}"),
+        }
+    } else if device.ends_with("ttyS2") {
+        match configure_uart2() {
+            Ok(()) => eprintln!("[pinmux] UART2 pads routed (IIC0 SCL/SDA -> UART2 TX/RX)"),
+            Err(err) => eprintln!("[pinmux] failed to configure UART2 via {PINMUX_DEVICE}: {err}"),
         }
     } else {
         eprintln!("[pinmux] no pinmux profile for {device}; assuming pads already muxed");
