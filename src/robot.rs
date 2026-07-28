@@ -326,11 +326,8 @@ fn handle_detections(
 
             eprintln!("[grab] executing grab sequence");
             arm.grab();
-            sleep_us(2_000_000);
             arm.release();
-            sleep_us(1_000_000);
             arm.grab_pos();
-            sleep_us(1_000_000);
 
             robot.grab_confirm_count = 0;
             robot.status = RobotStatus::ChaseTennis;
