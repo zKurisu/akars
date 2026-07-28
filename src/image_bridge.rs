@@ -148,6 +148,11 @@ pub fn yuv422p_to_rgb_planar(
     let (w, h) = valid_dimensions(width, height)?;
     let w = w as usize;
     let h = h as usize;
+    if (w & 1) != 0 {
+        return Err(ImageBridgeError::InvalidInput(
+            "I422 conversion requires an even image width",
+        ));
+    }
     let y_size = w * h;
     let chroma_w = w / 2;
     let chroma_size = chroma_w * h;
@@ -168,26 +173,48 @@ pub fn yuv422p_to_rgb_planar(
     let (r_plane, rest) = dst.split_at_mut(y_size);
     let (g_plane, b_plane) = rest.split_at_mut(y_size);
 
+    yuv422p_to_rgb_planar_scalar(y_plane, u_plane, v_plane, r_plane, g_plane, b_plane, w, h);
+    Ok(())
+}
+
+fn yuv422p_to_rgb_planar_scalar(
+    y_plane: &[u8],
+    u_plane: &[u8],
+    v_plane: &[u8],
+    r_plane: &mut [u8],
+    g_plane: &mut [u8],
+    b_plane: &mut [u8],
+    w: usize,
+    h: usize,
+) {
+    let chroma_w = w / 2;
+
+    // I422 shares one U/V sample across two horizontal pixels, so compute the
+    // chroma contribution once per pair and reuse it for both luma samples.
     for row in 0..h {
         let y_row = row * w;
         let chroma_row = row * chroma_w;
-        for col in 0..w {
-            let y = y_plane[y_row + col] as i32;
-            let chroma_idx = chroma_row + col / 2;
+        for pair in 0..chroma_w {
+            let chroma_idx = chroma_row + pair;
             let u = u_plane[chroma_idx] as i32 - 128;
             let v = v_plane[chroma_idx] as i32 - 128;
+            let r_uv = (91881 * v) >> 16;
+            let g_uv = (22554 * u + 46802 * v) >> 16;
+            let b_uv = (116130 * u) >> 16;
 
-            let r = y + ((91881 * v) >> 16);
-            let g = y - ((22554 * u + 46802 * v) >> 16);
-            let b = y + ((116130 * u) >> 16);
+            let idx0 = y_row + pair * 2;
+            let y0 = y_plane[idx0] as i32;
+            r_plane[idx0] = clamp_u8(y0 + r_uv);
+            g_plane[idx0] = clamp_u8(y0 - g_uv);
+            b_plane[idx0] = clamp_u8(y0 + b_uv);
 
-            let idx = y_row + col;
-            r_plane[idx] = clamp_u8(r);
-            g_plane[idx] = clamp_u8(g);
-            b_plane[idx] = clamp_u8(b);
+            let idx1 = idx0 + 1;
+            let y1 = y_plane[idx1] as i32;
+            r_plane[idx1] = clamp_u8(y1 + r_uv);
+            g_plane[idx1] = clamp_u8(y1 - g_uv);
+            b_plane[idx1] = clamp_u8(y1 + b_uv);
         }
     }
-    Ok(())
 }
 
 /// Convert an I422 frame to RGB and save it as an image (format inferred from

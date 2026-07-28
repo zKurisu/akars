@@ -1,6 +1,7 @@
 use crate::arm::Arm;
 use crate::camera::UsbCamera;
 use crate::detector::Detection;
+use crate::image_bridge;
 use crate::motor::Motor;
 use crate::tpu::{InferTiming, InferenceConfig, YoloModel};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,20 +125,30 @@ pub fn run_tennis_hunter(
     config: RobotConfig,
 ) {
     let mut robot = RobotState::default();
-    let mut frame_idx = 0u64;
     let mut total_time = Duration::ZERO;
     let mut frame_count = 0u64;
+    let mut frame_idx = 0u64;
+    let (model_w, model_h) = model.input_dimensions();
+    let rgb_len = (model_w as usize)
+        .checked_mul(model_h as usize)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .unwrap_or(0);
+    if rgb_len == 0 {
+        eprintln!("[camera] invalid model input size: {}x{}", model_w, model_h);
+        motor.standby();
+        return;
+    }
+    let mut rgb_planar = vec![0u8; rgb_len];
 
     arm.grab_pos();
 
     while !stop_requested() {
-        if let Some(max_frames) = config.max_frames {
-            if frame_idx >= max_frames {
+        if let Some(limit) = config.max_frames {
+            if frame_idx >= limit {
                 break;
             }
         }
 
-        let frame_start = Instant::now();
         frame_idx += 1;
 
         let capture_start = Instant::now();
@@ -151,36 +162,58 @@ pub fn run_tennis_hunter(
         };
         let capture_us = capture_start.elapsed().as_micros() as i64;
 
+        let preprocess_start = Instant::now();
+        if let Err(err) =
+            image_bridge::yuv422p_to_rgb_planar(&frame.pixels, &mut rgb_planar, model_w, model_h)
+        {
+            eprintln!("[pre] YUV preprocess failed: {err}");
+            continue;
+        }
+        let preprocess_us = preprocess_start.elapsed().as_micros() as i64;
+
+        let image_w = frame.width as i32;
+        let image_h = frame.height as i32;
         let mut timing = InferTiming::default();
-        let detections = match model.infer_timed(&frame, config.inference, Some(&mut timing)) {
+        let detections = match model.infer_rgb_planar_timed(
+            &rgb_planar,
+            image_w,
+            image_h,
+            config.inference,
+            Some(&mut timing),
+        ) {
             Ok(detections) => detections,
             Err(err) => {
                 eprintln!("[detect] inference failed: {err}");
-                sleep_us(100_000);
                 continue;
             }
         };
 
         eprintln!(
-            "[time] capture={:.1} pre={:.1}(dec={:.1} rsz={:.1}) fwd={:.1} post={:.1} ms",
+            "[time] frame={} capture={:.1} pre={:.1} fwd={:.1} post={:.1} ms",
+            frame_idx,
             capture_us as f32 / 1000.0,
-            timing.preprocess_us as f32 / 1000.0,
-            timing.decode_us as f32 / 1000.0,
-            timing.resize_us as f32 / 1000.0,
+            preprocess_us as f32 / 1000.0,
             timing.forward_us as f32 / 1000.0,
             timing.postprocess_us as f32 / 1000.0,
         );
 
+        let control_start = Instant::now();
         handle_detections(
             &detections,
-            frame.width as i32,
-            frame.height as i32,
+            image_w,
+            image_h,
             &mut robot,
             &mut motor,
             &mut arm,
         );
 
-        let frame_time = frame_start.elapsed();
+        let control_time = control_start.elapsed();
+        let frame_time = Duration::from_micros(
+            capture_us.max(0) as u64
+                + preprocess_us.max(0) as u64
+                + timing.forward_us.max(0) as u64
+                + timing.postprocess_us.max(0) as u64,
+        ) + control_time;
         total_time += frame_time;
         frame_count += 1;
         let fps = if frame_time.as_secs_f32() > 0.0 {
@@ -194,10 +227,11 @@ pub fn run_tennis_hunter(
             0.0
         };
         println!(
-            "[FPS] {:.2} avg: {:.2} ({:.1}ms)",
+            "[FPS] {:.2} avg: {:.2} ({:.1}ms, control={:.1}ms)",
             fps,
             avg_fps,
-            frame_time.as_secs_f32() * 1000.0
+            frame_time.as_secs_f32() * 1000.0,
+            control_time.as_secs_f32() * 1000.0
         );
     }
 

@@ -141,6 +141,10 @@ mod imp {
         preprocessor: image_bridge::ImagePreprocessor,
     }
 
+    // The model handle is owned by a single TPU worker thread. We do not share
+    // it across threads; we only move ownership into the worker.
+    unsafe impl Send for YoloModel {}
+
     impl YoloModel {
         pub fn open(path: &Path) -> Result<Self, TpuError> {
             let c_path = CString::new(path.as_os_str().as_bytes())
@@ -212,6 +216,10 @@ mod imp {
             self.infer_timed(frame, config, None)
         }
 
+        pub fn input_dimensions(&self) -> (i32, i32) {
+            (self.input_w, self.input_h)
+        }
+
         pub fn infer_timed(
             &mut self,
             frame: &CameraFrame,
@@ -242,6 +250,38 @@ mod imp {
                     decode_us: 0,
                     resize_us: preprocess_us,
                     preprocess_us,
+                    forward_us,
+                    postprocess_us,
+                };
+            }
+            Ok(detections)
+        }
+
+        pub fn infer_rgb_planar_timed(
+            &mut self,
+            rgb_planar: &[u8],
+            image_w: i32,
+            image_h: i32,
+            config: InferenceConfig,
+            mut timing: Option<&mut InferTiming>,
+        ) -> Result<Vec<Detection>, TpuError> {
+            let copy_start = Instant::now();
+            let (input_ptr, input_len) = self.input_buffer()?;
+            if rgb_planar.len() < input_len {
+                return Err(TpuError::new("RGB planar input buffer is too small"));
+            }
+            let input = unsafe { slice::from_raw_parts_mut(input_ptr, input_len) };
+            input.copy_from_slice(&rgb_planar[..input_len]);
+            let copy_us = copy_start.elapsed().as_micros() as i64;
+
+            let (detections, forward_us, postprocess_us) =
+                self.forward_and_detections(config, image_w, image_h)?;
+
+            if let Some(t) = timing.as_deref_mut() {
+                *t = InferTiming {
+                    decode_us: 0,
+                    resize_us: copy_us,
+                    preprocess_us: copy_us,
                     forward_us,
                     postprocess_us,
                 };
@@ -447,9 +487,26 @@ mod imp {
             ))
         }
 
+        pub fn input_dimensions(&self) -> (i32, i32) {
+            (0, 0)
+        }
+
         pub fn infer_timed(
             &mut self,
             _frame: &CameraFrame,
+            _config: InferenceConfig,
+            _timing: Option<&mut InferTiming>,
+        ) -> Result<Vec<Detection>, TpuError> {
+            Err(TpuError::new(
+                "akars was built without SG2002 TPU runtime support",
+            ))
+        }
+
+        pub fn infer_rgb_planar_timed(
+            &mut self,
+            _rgb_planar: &[u8],
+            _image_w: i32,
+            _image_h: i32,
             _config: InferenceConfig,
             _timing: Option<&mut InferTiming>,
         ) -> Result<Vec<Detection>, TpuError> {
