@@ -59,5 +59,9 @@ path = "src/bin/test_servo2_lift.rs"
 name = "test_servo2_prepare"
 path = "src/bin/test_servo2_prepare.rs"
 
+[[bin]]
+name = "red_cloth_follow"
+path = "src/bin/red_cloth_follow.rs"
+
 [profile.release]
 lto = "thin"
