@@ -54,14 +54,16 @@ const REFERENCE_FRAME_WIDTH: f32 = 640.0;
 /// ~0.55 = ball fills the screen top-to-bottom at 640×480.
 const GRAB_AREA: f32 = 0.55;
 const CENTER_MARGIN: i32 = 35;
+/// Offset the "centred" target position to the right of image centre.
+/// 0 = dead centre, positive = rightward.  Unit: pixels at 640×480.
+const GRAB_CENTER_OFFSET: i32 = 25;
 const K_TURN_PULSE: f32 = 2500.0;
 const TURN_PULSE_MAX_US: u64 = 120_000;
 /// Only back up if the ball literally fills nearly the whole frame.
 const GRAB_AREA_MAX: f32 = 0.85;
-const CHASE_SPEED: i32 = 56;
+const CHASE_SPEED: i32 = 45;
 const TURN_SPEED: i32 = 10;
-const IDLE_SPEED: i32 = 8;
-const SEARCH_PULSE_US: u64 = 200_000;
+const IDLE_SPEED: i32 = 12;
 const TURN_PULSE_MIN_US: u64 = 25_000;
 const GRAB_CONFIRM_THRESHOLD: i32 = 2;
 const BACKWARD_SPEED: i32 = 16;
@@ -109,9 +111,9 @@ pub fn run_tennis_hunter(
     eprintln!(
         "[cfg] GRAB_AREA={:.3} GRAB_AREA_MAX={:.3} \
          CHASE_SPEED={CHASE_SPEED} CONFIRM={GRAB_CONFIRM_THRESHOLD} \
-         IDLE={IDLE_SPEED} SEARCH_PULSE={}ms CENTER_MARGIN={CENTER_MARGIN} \
+         IDLE={IDLE_SPEED} CENTER={CENTER_MARGIN}±{GRAB_CENTER_OFFSET} \
          TURN_PULSE=[{TURN_PULSE_MIN_US}..{TURN_PULSE_MAX_US}]us",
-        GRAB_AREA, GRAB_AREA_MAX, SEARCH_PULSE_US / 1000,
+        GRAB_AREA, GRAB_AREA_MAX,
     );
 
     while !stop_requested() {
@@ -257,22 +259,22 @@ fn handle_detections(
 ) {
     if detections.is_empty() {
         eprintln!("[detect] no ball detected, searching");
-        if robot.grab_confirm_count > 0 {
-            // Ball disappeared while we were approaching — it may be directly
-            // under the camera.  Back up a little before resuming search.
-            eprintln!("[detect] lost ball during approach, backing up");
+        // Ball was recently close (area > 30%) and now disappeared —
+        // likely blocking the camera.  Back up further to get a clear view.
+        let was_close = robot.area_ratio >= 0.30 || robot.grab_confirm_count > 0;
+        if was_close {
+            eprintln!(
+                "[detect] ball disappeared at area={:.3}, backing up to re-detect",
+                robot.area_ratio
+            );
             motor.backward(BACKWARD_SPEED);
-            sleep_us(BACKWARD_PULSE_US);
+            sleep_us(BACKWARD_PULSE_US * 8);
             motor.standby();
         }
         robot.grab_confirm_count = 0;
         robot.status = RobotStatus::ChaseTennis;
-        // Turn for a fixed pulse then stop so the camera gets an un-blurred
-        // view next frame, but the pulse is long enough (600 ms) to produce
-        // useful rotation even at slow frame rates.
+        // Continuous clockwise rotation while searching — no stop.
         motor.drive(IDLE_SPEED, -IDLE_SPEED);
-        sleep_us(SEARCH_PULSE_US);
-        motor.standby();
         return;
     }
 
@@ -288,8 +290,8 @@ fn handle_detections(
     let image_area = (image_w.max(1) * image_h.max(1)) as f32;
     let area_ratio = (best.bbox.w * best.bbox.h) / image_area;
     let ball_cx = best.bbox.x as i32;
-    let center = image_w / 2;
-    let center_margin = scaled_center_margin(image_w);
+    let center = image_w / 2 + scaled_center_margin(image_w, GRAB_CENTER_OFFSET);
+    let center_margin = scaled_center_margin(image_w, CENTER_MARGIN);
     let offset = ball_cx - center;
     let centered = offset.abs() <= center_margin;
     let pulse_us = turn_pulse_us(area_ratio);
@@ -354,20 +356,20 @@ fn handle_detections(
 }
 
 /// Progressively reduce forward speed as the target gets larger in frame.
-/// Keeps full CHASE_SPEED when the ball is very small (&lt; 15% of frame),
-/// then linearly ramps down to a creep speed near GRAB_AREA.
+/// Uses a quadratic curve: far away stays at full CHASE_SPEED, but speed
+/// drops FAST as the ball fills the screen, preventing overshoot.
 fn chase_speed(area_ratio: f32) -> i32 {
     if area_ratio >= GRAB_AREA {
         return 0; // close enough — stop
     }
-    if area_ratio < 0.10 {
-        return CHASE_SPEED; // far away: full speed 56
-    }
-    // 10 % → GRAB_AREA (55 %): linear ramp 56 → 5 (creep)
-    // Decelerates early so the car doesn't overshoot at 3–5 FPS.
-    let t = (area_ratio - 0.10) / (GRAB_AREA - 0.10);
-    let speed = CHASE_SPEED as f32 * (1.0 - t) + 5.0 * t;
-    speed.round().max(1.0) as i32
+    // Quadratic falloff from 0 → GRAB_AREA.  Even at small area ratios
+    // (e.g. 3 %) the speed is already reduced, preventing over-aggressive
+    // charging when the ball is first spotted.
+    //
+    //  area=0.03 → 38   area=0.10 → 27   area=0.30 → 8   area=0.50 → 1
+    let t = area_ratio / GRAB_AREA;
+    let speed = CHASE_SPEED as f32 * (1.0 - t) * (1.0 - t);
+    speed.max(6.0).round() as i32
 }
 
 fn align(offset: i32, pulse_us: u64, motor: &mut Motor) {
@@ -380,8 +382,8 @@ fn align(offset: i32, pulse_us: u64, motor: &mut Motor) {
     motor.standby();
 }
 
-fn scaled_center_margin(image_w: i32) -> i32 {
-    ((CENTER_MARGIN as f32) * image_w as f32 / REFERENCE_FRAME_WIDTH)
+fn scaled_center_margin(image_w: i32, base: i32) -> i32 {
+    ((base as f32) * image_w as f32 / REFERENCE_FRAME_WIDTH)
         .round()
         .max(1.0) as i32
 }
@@ -400,8 +402,8 @@ mod tests {
 
     #[test]
     fn scales_center_margin() {
-        assert_eq!(scaled_center_margin(640), 35);
-        assert_eq!(scaled_center_margin(320), 18);
+        assert_eq!(scaled_center_margin(640, 35), 35);
+        assert_eq!(scaled_center_margin(320, 35), 18);
     }
 
     #[test]

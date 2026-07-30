@@ -17,15 +17,15 @@ const PULSE_MAX: i32 = 2500;
 // ── Step 1: Initial/ready position ──
 const S0_READY: f32 = 150.0;
 const S1_READY: f32 = 140.0;
-const S2_READY: f32 = 120.0;
+const S2_READY: f32 = 100.0;
 
 // ── Step 2: Reach down, push ball toward body ──
-const S0_REACH: f32 = 200.0; // servo0 swings down
-const S1_PUSH: f32 = 100.0; // servo1 pushes arm toward ball
+const S0_REACH: f32 = 198.0; // servo0 swings down
+const S1_PUSH: f32 = 115.0; // servo1 pushes arm toward ball
 
 // ── Step 3: Open gripper wide + continue pushing ──
 const S2_OPEN: f32 = 180.0; // gripper fully open (was 150, wider for visibility)
-const S1_CONTINUE: f32 = 90.0; // servo1 keeps going down
+const S1_CONTINUE: f32 = 95.0; // servo1 keeps going down
 
 // ── Step 4: Close gripper to grab ball ──
 const S2_CLOSE: f32 = 80.0; // gripper clamped closed (was 100, tighter grip)
