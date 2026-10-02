@@ -106,7 +106,6 @@ const BACKWARD_SPEED: i32 = 16;
 const BACKWARD_PULSE_US: u64 = 80_000;
 const RED_CRAWL_SPEED: i32 = 6;
 const RELEASE_SETTLE_US: u64 = 1_000_000;
-const RELEASE_CLEAR_PULSE_US: u64 = 500_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RedMissionAction {
@@ -525,19 +524,10 @@ fn handle_red_container(
                 "AKARS_MISSION_TRANSITION from=ApproachRedContainer to=ReleaseTennis holding_ball=1"
             );
 
-            // Preserve the existing calibrated arm methods and only sequence
-            // them after the red approach has completed.
-            arm.release_pos();
-            sleep_us(RELEASE_SETTLE_US);
+            // The user-requested drop happens immediately from the existing
+            // post-grab carrying pose. Do not lower the arm first and do not
+            // change the calibrated gripper-open operation itself.
             arm.release();
-            sleep_us(RELEASE_SETTLE_US);
-
-            // Clear the container before returning the arm to its original
-            // tennis-search pose, matching the original high-level workflow.
-            motor.backward(BACKWARD_SPEED);
-            sleep_us(RELEASE_CLEAR_PULSE_US);
-            motor.standby();
-            arm.grab_pos();
             sleep_us(RELEASE_SETTLE_US);
 
             robot.mark_deposit_complete();
@@ -547,6 +537,12 @@ fn handle_red_container(
             if let Err(error) = camera.re_init() {
                 eprintln!("[camera] re-init after release failed: {error}");
             }
+            // Arm::grab() already left servos 0/1 in the raised ready pose.
+            // Do not call grab_pos() here: it would command gripper servo 2
+            // back from fully-open 180 degrees to the 100-degree ready angle.
+            // Keep the gripper open and resume the original in-place search.
+            eprintln!("AKARS_MISSION_ACTION action=turn_around_and_search direction=right");
+            search_for_target(motor);
         }
     }
 }

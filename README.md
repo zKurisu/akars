@@ -77,10 +77,11 @@ Run on device:
 The autonomous mission is cyclic: chase and grab a tennis ball, search for the
 red container only after the grab completes, approach until its bounding box
 covers 100% of the frame width and 98% of its height for three frames, release
-the ball, back away, and resume tennis-ball chasing. Red detections are ignored
-while the gripper is empty. The current ZP10 arm interface has no ball-presence
-sensor, so `holding_ball` records completion of the existing blocking
-`Arm::grab()` sequence rather than independent physical feedback.
+the ball directly from the carrying pose, rotate in place to search behind it,
+and resume tennis-ball chasing. Red detections are ignored while the gripper is
+empty. The current ZP10 arm interface has no ball-presence sensor, so
+`holding_ball` records completion of the existing blocking `Arm::grab()`
+sequence rather than independent physical feedback.
 
 Useful options:
 
