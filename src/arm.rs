@@ -32,6 +32,7 @@ const S1_CONTINUE: f32 = 95.0; // servo1 keeps going down
 // gripper needs more travel to release a loaded ball reliably.
 const S2_DEPOSIT_OPEN: f32 = 200.0;
 const S2_DEPOSIT_MIN_ACTUAL: f32 = 190.0;
+const S2_DEPOSIT_CLOSE_MAX_ACTUAL: f32 = 90.0;
 const DEPOSIT_RELEASE_ATTEMPTS: usize = 3;
 
 // ── Step 4: Close gripper to grab ball ──
@@ -166,6 +167,31 @@ impl Arm {
         Err(last_error.unwrap_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "deposit release verification failed")
         }))
+    }
+    /// Return the gripper to the original 80-degree closed position as soon
+    /// as the deposited ball has been released. Chassis movement remains
+    /// inhibited until servo 2 reports that it has closed again.
+    pub fn close_after_deposit_verified(&mut self) -> io::Result<f32> {
+        eprintln!("AKARS_GRIPPER_RESTORE servo=2 target_angle={S2_CLOSE} chassis_stopped=1");
+        self.set_angle(2, S2_CLOSE, 1000);
+        sleep_ms(1500);
+
+        let actual_angle = self.read_angle(2)?;
+        let reached = actual_angle <= S2_DEPOSIT_CLOSE_MAX_ACTUAL;
+        eprintln!(
+            "AKARS_GRIPPER_RESTORE_POSITION servo=2 target_angle={S2_CLOSE} actual_angle={actual_angle:.1} maximum_angle={S2_DEPOSIT_CLOSE_MAX_ACTUAL} reached={}",
+            i32::from(reached),
+        );
+        if reached {
+            Ok(actual_angle)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "servo 2 did not return to closed position: actual={actual_angle:.1}, maximum={S2_DEPOSIT_CLOSE_MAX_ACTUAL:.1}"
+                ),
+            ))
+        }
     }
 
     /// Read the actual servo position using the controller's PRAD command.

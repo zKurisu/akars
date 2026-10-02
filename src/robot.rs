@@ -545,6 +545,25 @@ fn handle_red_container(
             eprintln!(
                 "AKARS_GRIPPER_RELEASE_COMPLETE servo=2 target_angle=200 actual_angle={actual_angle:.1} verified=1 chassis_stopped=1"
             );
+            let closed_angle = match arm.close_after_deposit_verified() {
+                Ok(actual_angle) => actual_angle,
+                Err(error) => {
+                    eprintln!(
+                        "AKARS_GRIPPER_RESTORE_FAULT release_verified=1 chassis_stopped=1 error={error}"
+                    );
+                    eprintln!(
+                        "AKARS_MISSION_HALT reason=gripper_close_unverified action=manual_stop_required"
+                    );
+                    while !stop_requested() {
+                        motor.standby();
+                        sleep_us(100_000);
+                    }
+                    return;
+                }
+            };
+            eprintln!(
+                "AKARS_GRIPPER_RESTORE_COMPLETE servo=2 target_angle=80 actual_angle={closed_angle:.1} verified=1 chassis_stopped=1"
+            );
 
             robot.mark_deposit_complete();
             eprintln!("AKARS_MISSION_TRANSITION from=ReleaseTennis to=ChaseTennis holding_ball=0");
@@ -553,10 +572,10 @@ fn handle_red_container(
             if let Err(error) = camera.re_init() {
                 eprintln!("[camera] re-init after release failed: {error}");
             }
-            // Arm::grab() already left servos 0/1 in the raised ready pose.
-            // Do not call grab_pos() here: it would command gripper servo 2
-            // back from deposit-open 200 degrees to the 100-degree ready angle.
-            // Keep the gripper open and resume the original in-place search.
+            // Servos 0/1 stay in the raised carrying pose. Servo 2 has already
+            // returned directly from deposit-open 200 degrees to the original
+            // 80-degree closed position; do not call grab_pos(), which would
+            // replace that position with the 100-degree ready angle.
             eprintln!("AKARS_MISSION_ACTION action=turn_around_and_search direction=right");
             search_for_target(motor);
         }
