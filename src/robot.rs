@@ -105,7 +105,11 @@ const GRAB_CONFIRM_THRESHOLD: i32 = 2;
 const BACKWARD_SPEED: i32 = 16;
 const BACKWARD_PULSE_US: u64 = 80_000;
 const RED_CRAWL_SPEED: i32 = 6;
-const RELEASE_SETTLE_US: u64 = 1_000_000;
+// The arm UART protocol has no acknowledgement or position feedback. Under a
+// held-ball load one open command was not reliable enough in the field, so
+// repeat the unchanged calibrated release command and do not move the chassis
+// until both travel windows have elapsed.
+const RELEASE_COMMAND_SETTLE_US: u64 = 1_500_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RedMissionAction {
@@ -527,8 +531,20 @@ fn handle_red_container(
             // The user-requested drop happens immediately from the existing
             // post-grab carrying pose. Do not lower the arm first and do not
             // change the calibrated gripper-open operation itself.
+            eprintln!(
+                "AKARS_GRIPPER_RELEASE phase=first servo=2 angle=180 chassis_stopped=1"
+            );
             arm.release();
-            sleep_us(RELEASE_SETTLE_US);
+            sleep_us(RELEASE_COMMAND_SETTLE_US);
+            eprintln!(
+                "AKARS_GRIPPER_RELEASE phase=confirm servo=2 angle=180 chassis_stopped=1"
+            );
+            arm.release();
+            sleep_us(RELEASE_COMMAND_SETTLE_US);
+            eprintln!(
+                "AKARS_GRIPPER_RELEASE_COMPLETE servo=2 angle=180 hold_ms={} chassis_stopped=1",
+                RELEASE_COMMAND_SETTLE_US * 2 / 1000,
+            );
 
             robot.mark_deposit_complete();
             eprintln!("AKARS_MISSION_TRANSITION from=ReleaseTennis to=ChaseTennis holding_ball=0");
