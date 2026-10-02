@@ -1,5 +1,12 @@
 //! Lightweight red-target detection directly on planar YUV422 camera frames.
 
+pub const DEFAULT_RED_MINIMUM_PIXELS: usize = 200;
+pub const DEFAULT_RED_STOP_AREA_RATIO: f32 = 0.98;
+pub const DEFAULT_RED_STOP_MIN_AREA_RATIO: f32 = 0.55;
+pub const DEFAULT_RED_STOP_WIDTH_RATIO: f32 = 1.00;
+pub const DEFAULT_RED_STOP_HEIGHT_RATIO: f32 = 0.98;
+pub const DEFAULT_RED_STOP_CONFIRM_FRAMES: u32 = 3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RedThreshold {
     /// Minimum luma accepted as a visible target pixel.
@@ -49,6 +56,24 @@ impl RedObservation {
     pub fn bbox_area_ratio(self) -> f32 {
         self.bbox_width_ratio() * self.bbox_height_ratio()
     }
+}
+
+/// Return whether the red container is close enough for depositing a ball.
+///
+/// The standalone red-target tool exposes these values as CLI options, while
+/// the integrated mission uses the verified defaults above. Keeping the pure
+/// geometry predicate here prevents the two paths from silently diverging.
+pub fn reaches_stop_geometry(
+    red: RedObservation,
+    stop_area_ratio: f32,
+    stop_min_area_ratio: f32,
+    stop_width_ratio: f32,
+    stop_height_ratio: f32,
+) -> bool {
+    red.area_ratio() >= stop_area_ratio
+        || (red.area_ratio() >= stop_min_area_ratio
+            && red.bbox_width_ratio() >= stop_width_ratio
+            && red.bbox_height_ratio() >= stop_height_ratio)
 }
 
 /// Detect the only red target in a planar YUV422 (I422/YU16) camera frame.

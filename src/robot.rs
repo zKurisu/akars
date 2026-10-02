@@ -2,6 +2,11 @@ use crate::arm::Arm;
 use crate::camera::UsbCamera;
 use crate::detector::Detection;
 use crate::motor::Motor;
+use crate::red_target::{
+    detect_red_yuv422p, reaches_stop_geometry, RedObservation, RedThreshold,
+    DEFAULT_RED_MINIMUM_PIXELS, DEFAULT_RED_STOP_AREA_RATIO, DEFAULT_RED_STOP_CONFIRM_FRAMES,
+    DEFAULT_RED_STOP_HEIGHT_RATIO, DEFAULT_RED_STOP_MIN_AREA_RATIO, DEFAULT_RED_STOP_WIDTH_RATIO,
+};
 use crate::tpu::{InferTiming, InferenceConfig, YoloModel};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -24,10 +29,13 @@ impl Default for RobotConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RobotStatus {
     ChaseTennis,
     GrabTennis,
+    FindRedContainer,
+    ApproachRedContainer,
+    ReleaseTennis,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +44,8 @@ struct RobotState {
     area_ratio: f32,
     ball_cx: i32,
     grab_confirm_count: i32,
+    holding_ball: bool,
+    red_confirm_count: u32,
 }
 
 impl Default for RobotState {
@@ -45,7 +55,33 @@ impl Default for RobotState {
             area_ratio: 0.0,
             ball_cx: 0,
             grab_confirm_count: 0,
+            holding_ball: false,
+            red_confirm_count: 0,
         }
+    }
+}
+
+impl RobotState {
+    fn mark_grab_complete(&mut self) {
+        self.holding_ball = true;
+        self.status = RobotStatus::FindRedContainer;
+        self.area_ratio = 0.0;
+        self.ball_cx = 0;
+        self.grab_confirm_count = 0;
+        self.red_confirm_count = 0;
+    }
+
+    fn mark_deposit_complete(&mut self) {
+        self.holding_ball = false;
+        self.status = RobotStatus::ChaseTennis;
+        self.area_ratio = 0.0;
+        self.ball_cx = 0;
+        self.grab_confirm_count = 0;
+        self.red_confirm_count = 0;
+    }
+
+    fn may_approach_red(&self) -> bool {
+        self.holding_ball
     }
 }
 
@@ -68,6 +104,18 @@ const TURN_PULSE_MIN_US: u64 = 25_000;
 const GRAB_CONFIRM_THRESHOLD: i32 = 2;
 const BACKWARD_SPEED: i32 = 16;
 const BACKWARD_PULSE_US: u64 = 80_000;
+const RED_CRAWL_SPEED: i32 = 6;
+const RELEASE_SETTLE_US: u64 = 1_000_000;
+const RELEASE_CLEAR_PULSE_US: u64 = 500_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedMissionAction {
+    Ignore,
+    Search,
+    Chase(ChaseMotion),
+    HoldForConfirmation,
+    Deposit,
+}
 
 /// Motor decision shared by the tennis hunter and any target follower that
 /// must move exactly like the original tennis chase.
@@ -121,8 +169,12 @@ pub fn run_tennis_hunter(
         "[cfg] GRAB_AREA={:.3} GRAB_AREA_MAX={:.3} \
          CHASE_SPEED={CHASE_SPEED} CONFIRM={GRAB_CONFIRM_THRESHOLD} \
          IDLE={IDLE_SPEED} CENTER={CENTER_MARGIN}±{GRAB_CENTER_OFFSET} \
-         TURN_PULSE=[{TURN_PULSE_MIN_US}..{TURN_PULSE_MAX_US}]us",
-        GRAB_AREA, GRAB_AREA_MAX,
+         TURN_PULSE=[{TURN_PULSE_MIN_US}..{TURN_PULSE_MAX_US}]us \
+         RED_STOP={:.0}%x{:.0}% RED_CONFIRM={DEFAULT_RED_STOP_CONFIRM_FRAMES}",
+        GRAB_AREA,
+        GRAB_AREA_MAX,
+        DEFAULT_RED_STOP_WIDTH_RATIO * 100.0,
+        DEFAULT_RED_STOP_HEIGHT_RATIO * 100.0,
     );
 
     while !stop_requested() {
@@ -196,25 +248,36 @@ pub fn run_tennis_hunter(
         let capture_us = capture_start.elapsed().as_micros() as i64;
 
         let mut timing = InferTiming::default();
-        let detections = match model.infer_timed(&frame, config.inference, Some(&mut timing)) {
-            Ok(detections) => detections,
-            Err(err) => {
-                eprintln!("[detect] inference failed: {err}");
-                sleep_us(100_000);
-                continue;
-            }
-        };
-
         let handle_start = Instant::now();
-        handle_detections(
-            &detections,
-            frame.width as i32,
-            frame.height as i32,
-            &mut robot,
-            &mut motor,
-            &mut arm,
-            &mut camera,
-        );
+        if robot.may_approach_red() {
+            handle_red_container(
+                &frame.pixels,
+                usize::from(frame.width),
+                usize::from(frame.height),
+                &mut robot,
+                &mut motor,
+                &mut arm,
+                &mut camera,
+            );
+        } else {
+            let detections = match model.infer_timed(&frame, config.inference, Some(&mut timing)) {
+                Ok(detections) => detections,
+                Err(err) => {
+                    eprintln!("[detect] inference failed: {err}");
+                    sleep_us(100_000);
+                    continue;
+                }
+            };
+            handle_detections(
+                &detections,
+                frame.width as i32,
+                frame.height as i32,
+                &mut robot,
+                &mut motor,
+                &mut arm,
+                &mut camera,
+            );
+        }
         let handle_us = handle_start.elapsed().as_micros() as i64;
 
         let frame_time = frame_start.elapsed();
@@ -243,14 +306,16 @@ pub fn run_tennis_hunter(
             0.0
         };
         eprintln!(
-            "[FPS] {:.2} avg: {:.2} ({:.1}ms) status={:?} area={:.3} cx={} confirm={}",
+            "[FPS] {:.2} avg: {:.2} ({:.1}ms) status={:?} holding_ball={} area={:.3} cx={} grab_confirm={} red_confirm={}",
             fps,
             avg_fps,
             frame_time.as_secs_f32() * 1000.0,
             robot.status,
+            robot.holding_ball,
             robot.area_ratio,
             robot.ball_cx,
             robot.grab_confirm_count,
+            robot.red_confirm_count,
         );
     }
 
@@ -333,14 +398,16 @@ fn handle_detections(
             }
 
             eprintln!("[grab] executing grab sequence");
+            // Keep Arm::grab() itself unchanged: its calibrated angles and
+            // timings are the existing, verified tennis-grab settings. It
+            // finishes with the arm lifted and the gripper closed.
             arm.grab();
-            arm.release();
-            arm.grab_pos();
+            robot.mark_grab_complete();
+            eprintln!(
+                "AKARS_MISSION_TRANSITION from=GrabTennis to=FindRedContainer holding_ball=1"
+            );
 
-            robot.grab_confirm_count = 0;
-            robot.status = RobotStatus::ChaseTennis;
-
-            // Grab took ~11 s — the camera pipeline likely timed out.
+            // Grab is intentionally blocking and can starve camera capture.
             // Reset it so the next capture doesn't get EIO.
             if let Err(e) = camera.re_init() {
                 eprintln!("[camera] re-init after grab failed: {e}");
@@ -354,6 +421,133 @@ fn handle_detections(
         robot.grab_confirm_count = 0;
         robot.status = RobotStatus::ChaseTennis;
         execute_chase_motion(chase_motion, motor);
+    }
+}
+
+fn decide_red_action(
+    robot: &mut RobotState,
+    observation: Option<RedObservation>,
+) -> RedMissionAction {
+    // Keep this guard local even though the main loop only enters the red path
+    // while carrying a ball: seeing red must never move an empty robot toward
+    // the container.
+    if !robot.may_approach_red() {
+        robot.red_confirm_count = 0;
+        return RedMissionAction::Ignore;
+    }
+
+    let Some(red) = observation.filter(|red| red.pixels >= DEFAULT_RED_MINIMUM_PIXELS) else {
+        robot.status = RobotStatus::FindRedContainer;
+        robot.area_ratio = 0.0;
+        robot.ball_cx = 0;
+        robot.red_confirm_count = 0;
+        return RedMissionAction::Search;
+    };
+
+    robot.area_ratio = red.area_ratio();
+    robot.ball_cx = red.center_x as i32;
+
+    if reaches_stop_geometry(
+        red,
+        DEFAULT_RED_STOP_AREA_RATIO,
+        DEFAULT_RED_STOP_MIN_AREA_RATIO,
+        DEFAULT_RED_STOP_WIDTH_RATIO,
+        DEFAULT_RED_STOP_HEIGHT_RATIO,
+    ) {
+        robot.status = RobotStatus::ApproachRedContainer;
+        robot.red_confirm_count = robot.red_confirm_count.saturating_add(1);
+        if robot.red_confirm_count >= DEFAULT_RED_STOP_CONFIRM_FRAMES {
+            robot.status = RobotStatus::ReleaseTennis;
+            return RedMissionAction::Deposit;
+        }
+        return RedMissionAction::HoldForConfirmation;
+    }
+
+    robot.status = RobotStatus::ApproachRedContainer;
+    robot.red_confirm_count = 0;
+    let motion = chase_motion(
+        red.center_x as i32,
+        red.area_ratio(),
+        red.frame_width as i32,
+    );
+    // Tennis motion stops at the grab distance. The red target must reach the
+    // closer 100% x 98% condition, so keep crawling until that is confirmed.
+    RedMissionAction::Chase(match motion {
+        ChaseMotion::Forward(0) => ChaseMotion::Forward(RED_CRAWL_SPEED),
+        motion => motion,
+    })
+}
+
+fn handle_red_container(
+    yuv422p: &[u8],
+    width: usize,
+    height: usize,
+    robot: &mut RobotState,
+    motor: &mut Motor,
+    arm: &mut Arm,
+    camera: &mut UsbCamera,
+) {
+    let observation = detect_red_yuv422p(yuv422p, width, height, RedThreshold::default());
+    let action = decide_red_action(robot, observation);
+
+    if let Some(red) = observation.filter(|red| red.pixels >= DEFAULT_RED_MINIMUM_PIXELS) {
+        eprintln!(
+            "AKARS_RED_TARGET pixels={} area={:.3} bbox={:.3}x{:.3} cx={} action={:?} holding_ball={}",
+            red.pixels,
+            red.area_ratio(),
+            red.bbox_width_ratio(),
+            red.bbox_height_ratio(),
+            red.center_x,
+            action,
+            robot.holding_ball,
+        );
+    } else {
+        eprintln!(
+            "AKARS_RED_TARGET pixels=0 action={:?} holding_ball={}",
+            action, robot.holding_ball,
+        );
+    }
+
+    match action {
+        RedMissionAction::Ignore => motor.standby(),
+        RedMissionAction::Search => search_for_target(motor),
+        RedMissionAction::Chase(motion) => execute_chase_motion(motion, motor),
+        RedMissionAction::HoldForConfirmation => {
+            motor.brake();
+            sleep_us(20_000);
+            motor.standby();
+        }
+        RedMissionAction::Deposit => {
+            motor.brake();
+            sleep_us(20_000);
+            motor.standby();
+            eprintln!(
+                "AKARS_MISSION_TRANSITION from=ApproachRedContainer to=ReleaseTennis holding_ball=1"
+            );
+
+            // Preserve the existing calibrated arm methods and only sequence
+            // them after the red approach has completed.
+            arm.release_pos();
+            sleep_us(RELEASE_SETTLE_US);
+            arm.release();
+            sleep_us(RELEASE_SETTLE_US);
+
+            // Clear the container before returning the arm to its original
+            // tennis-search pose, matching the original high-level workflow.
+            motor.backward(BACKWARD_SPEED);
+            sleep_us(RELEASE_CLEAR_PULSE_US);
+            motor.standby();
+            arm.grab_pos();
+            sleep_us(RELEASE_SETTLE_US);
+
+            robot.mark_deposit_complete();
+            eprintln!("AKARS_MISSION_TRANSITION from=ReleaseTennis to=ChaseTennis holding_ball=0");
+
+            // The release sequence blocks capture for several seconds.
+            if let Err(error) = camera.re_init() {
+                eprintln!("[camera] re-init after release failed: {error}");
+            }
+        }
     }
 }
 
@@ -428,7 +622,30 @@ fn sleep_us(us: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{scaled_center_margin, turn_pulse_us, TURN_PULSE_MAX_US, TURN_PULSE_MIN_US};
+    use super::{
+        decide_red_action, scaled_center_margin, turn_pulse_us, ChaseMotion, RedMissionAction,
+        RobotState, RobotStatus, DEFAULT_RED_STOP_CONFIRM_FRAMES, TURN_PULSE_MAX_US,
+        TURN_PULSE_MIN_US,
+    };
+    use crate::red_target::RedObservation;
+
+    fn red_observation(left: usize, top: usize, right: usize, bottom: usize) -> RedObservation {
+        let width = 640;
+        let height = 480;
+        let bbox_width = right - left + 1;
+        let bbox_height = bottom - top + 1;
+        RedObservation {
+            pixels: bbox_width * bbox_height,
+            center_x: (left + right) / 2,
+            center_y: (top + bottom) / 2,
+            left,
+            top,
+            right,
+            bottom,
+            frame_width: width,
+            frame_height: height,
+        }
+    }
 
     #[test]
     fn scales_center_margin() {
@@ -440,5 +657,75 @@ mod tests {
     fn clamps_turn_pulse() {
         assert_eq!(turn_pulse_us(0.0), TURN_PULSE_MIN_US);
         assert_eq!(turn_pulse_us(100.0), TURN_PULSE_MAX_US);
+    }
+
+    #[test]
+    fn red_is_ignored_when_gripper_is_empty() {
+        let mut robot = RobotState::default();
+        let full_frame = red_observation(0, 0, 639, 479);
+
+        assert_eq!(
+            decide_red_action(&mut robot, Some(full_frame)),
+            RedMissionAction::Ignore
+        );
+        assert_eq!(robot.status, RobotStatus::ChaseTennis);
+        assert!(!robot.holding_ball);
+        assert_eq!(robot.red_confirm_count, 0);
+    }
+
+    #[test]
+    fn successful_grab_enables_red_search_and_approach() {
+        let mut robot = RobotState::default();
+        robot.mark_grab_complete();
+        assert!(robot.holding_ball);
+        assert_eq!(robot.status, RobotStatus::FindRedContainer);
+
+        assert_eq!(
+            decide_red_action(&mut robot, None),
+            RedMissionAction::Search
+        );
+        let far_centered = red_observation(220, 140, 419, 339);
+        assert!(matches!(
+            decide_red_action(&mut robot, Some(far_centered)),
+            RedMissionAction::Chase(ChaseMotion::Forward(_))
+        ));
+        assert_eq!(robot.status, RobotStatus::ApproachRedContainer);
+    }
+
+    #[test]
+    fn close_red_requires_confirmation_before_deposit() {
+        let mut robot = RobotState::default();
+        robot.mark_grab_complete();
+        let close = red_observation(0, 0, 639, 470);
+
+        for expected in 1..DEFAULT_RED_STOP_CONFIRM_FRAMES {
+            assert_eq!(
+                decide_red_action(&mut robot, Some(close)),
+                RedMissionAction::HoldForConfirmation
+            );
+            assert_eq!(robot.red_confirm_count, expected);
+            assert!(robot.holding_ball);
+        }
+        assert_eq!(
+            decide_red_action(&mut robot, Some(close)),
+            RedMissionAction::Deposit
+        );
+        assert_eq!(robot.status, RobotStatus::ReleaseTennis);
+        assert!(robot.holding_ball);
+    }
+
+    #[test]
+    fn deposit_completion_returns_to_ball_chase_and_disables_red() {
+        let mut robot = RobotState::default();
+        robot.mark_grab_complete();
+        robot.mark_deposit_complete();
+
+        assert_eq!(robot.status, RobotStatus::ChaseTennis);
+        assert!(!robot.holding_ball);
+        assert_eq!(robot.red_confirm_count, 0);
+        assert_eq!(
+            decide_red_action(&mut robot, Some(red_observation(0, 0, 639, 479))),
+            RedMissionAction::Ignore
+        );
     }
 }

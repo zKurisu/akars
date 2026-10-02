@@ -6,7 +6,11 @@
 
 use akars::camera::UsbCamera;
 use akars::motor::{Motor, MotorConfig};
-use akars::red_target::{detect_red_yuv422p, RedObservation, RedThreshold};
+use akars::red_target::{
+    detect_red_yuv422p, reaches_stop_geometry, RedObservation, RedThreshold,
+    DEFAULT_RED_MINIMUM_PIXELS, DEFAULT_RED_STOP_AREA_RATIO, DEFAULT_RED_STOP_CONFIRM_FRAMES,
+    DEFAULT_RED_STOP_HEIGHT_RATIO, DEFAULT_RED_STOP_MIN_AREA_RATIO, DEFAULT_RED_STOP_WIDTH_RATIO,
+};
 use akars::robot::{
     chase_motion, chase_speed, execute_chase_motion, install_signal_handlers, search_for_target,
     stop_requested, ChaseMotion,
@@ -50,16 +54,16 @@ impl Default for Config {
             max_frames: None,
             max_seconds: Some(120),
             threshold: RedThreshold::default(),
-            minimum_pixels: 200,
+            minimum_pixels: DEFAULT_RED_MINIMUM_PIXELS,
             // The final approach should put the container across almost the
             // entire image and about 98% of its height. A 98% pixel-coverage
             // fallback cannot geometrically trigger with a bbox below 98%
             // height, so it cannot bypass the close-range geometry below.
-            stop_area_ratio: 0.98,
-            stop_bbox_min_area_ratio: 0.55,
-            stop_bbox_width_ratio: 1.00,
-            stop_bbox_height_ratio: 0.98,
-            stop_confirm_frames: 3,
+            stop_area_ratio: DEFAULT_RED_STOP_AREA_RATIO,
+            stop_bbox_min_area_ratio: DEFAULT_RED_STOP_MIN_AREA_RATIO,
+            stop_bbox_width_ratio: DEFAULT_RED_STOP_WIDTH_RATIO,
+            stop_bbox_height_ratio: DEFAULT_RED_STOP_HEIGHT_RATIO,
+            stop_confirm_frames: DEFAULT_RED_STOP_CONFIRM_FRAMES,
         }
     }
 }
@@ -128,10 +132,13 @@ impl ApproachController {
 }
 
 fn fills_view(red: RedObservation, config: &Config) -> bool {
-    red.area_ratio() >= config.stop_area_ratio
-        || (red.area_ratio() >= config.stop_bbox_min_area_ratio
-            && red.bbox_width_ratio() >= config.stop_bbox_width_ratio
-            && red.bbox_height_ratio() >= config.stop_bbox_height_ratio)
+    reaches_stop_geometry(
+        red,
+        config.stop_area_ratio,
+        config.stop_bbox_min_area_ratio,
+        config.stop_bbox_width_ratio,
+        config.stop_bbox_height_ratio,
+    )
 }
 
 fn main() {
@@ -520,10 +527,7 @@ mod tests {
         // Matches the real stalled geometry: the rectangular extent is over
         // the tennis 55% grab threshold, but actual red coverage is only 43%
         // and the red-object stop condition is not yet satisfied.
-        let motion = controller.decide(
-            Some(observation_with_bbox(50, 0.43, 0.91, 0.61)),
-            &config,
-        );
+        let motion = controller.decide(Some(observation_with_bbox(50, 0.43, 0.91, 0.61)), &config);
         assert_eq!(motion, Motion::Chase(ChaseMotion::Forward(6)));
     }
 

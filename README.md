@@ -9,7 +9,8 @@ Implemented scope:
 - YOLOv8 CVI runtime inference and postprocess from `aka-sg2002/detect.*`.
 - UART motor protocol from `aka-rk3588/motor/uart_motor_driver.*`.
 - ZP10D arm UART protocol from `aka-rk3588/arm`.
-- Tennis chasing and grab state machine from `aka-sg2002/tennis.cpp`.
+- Tennis chasing, grab, red-container return, and release state machine based
+  on the existing tennis controller and calibrated arm operations.
 
 `AKA-00/demo` and shell scripts are intentionally not rewritten here.
 
@@ -73,6 +74,14 @@ Run on device:
   --arm /dev/ttyS2
 ```
 
+The autonomous mission is cyclic: chase and grab a tennis ball, search for the
+red container only after the grab completes, approach until its bounding box
+covers 100% of the frame width and 98% of its height for three frames, release
+the ball, back away, and resume tennis-ball chasing. Red detections are ignored
+while the gripper is empty. The current ZP10 arm interface has no ball-presence
+sensor, so `holding_ball` records completion of the existing blocking
+`Arm::grab()` sequence rather than independent physical feedback.
+
 Useful options:
 
 - `--frames N`: stop after N frames for smoke tests.
@@ -120,10 +129,7 @@ timeout. Forward speed, pulsed steering, and continuous search reuse the same he
 ./red_cloth_follow --dry-run --max-frames 300
 ```
 
-The default full-view condition is either 70% red pixels, or at least 55% red
-pixels whose bounding box covers 95% of the frame width and 65% of its height.
-The second condition matches the actual container's wide aspect ratio measured
-on the 640x480 camera and prevents the robot from continuing forward after the
-container has already filled the horizontal field of view. Both conditions
-must hold for three consecutive frames. Use `--help` for threshold and safety
-limit options.
+The default full-view condition is either 98% red pixels, or at least 55% red
+pixels whose bounding box covers 100% of the frame width and 98% of its height.
+The condition must hold for three consecutive frames. Use `--help` for
+threshold and safety-limit options.
