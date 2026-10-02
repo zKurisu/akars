@@ -21,7 +21,10 @@ impl SerialPort {
         if nonblocking {
             open_opts.custom_flags(linux::O_NONBLOCK);
         }
-        eprintln!("[serial] opening {} (baud={baudrate}, nonblocking={nonblocking}) ...", path_str);
+        eprintln!(
+            "[serial] opening {} (baud={baudrate}, nonblocking={nonblocking}) ...",
+            path_str
+        );
         let file = open_opts.open(path_ref)?;
         eprintln!("[serial] {} opened, configuring ...", path_str);
         configure(file.as_raw_fd(), baudrate)?;
@@ -60,6 +63,24 @@ impl SerialPort {
         unsafe {
             linux::tcflush(self.file.as_raw_fd(), linux::TCIOFLUSH);
         }
+    }
+
+    /// Clear stale protocol replies even when the target OS does not fully
+    /// implement `tcflush(2)` for this UART driver.
+    pub fn discard_input(&mut self) -> io::Result<usize> {
+        self.flush();
+        let mut discarded = 0usize;
+        let mut buffer = [0u8; 64];
+        loop {
+            match self.file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => discarded += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(discarded)
     }
 }
 

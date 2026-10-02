@@ -5,6 +5,7 @@ pub mod image_bridge;
 pub mod linux;
 pub mod motor;
 pub mod pinmux;
+pub mod red_target;
 pub mod robot;
 pub mod serial;
 pub mod tpu;

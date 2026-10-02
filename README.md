@@ -102,3 +102,28 @@ Web control:
 
 Open `http://<device-ip>:8080/` to control the base and arm from the built-in frontend.
 Use `--mock` to run the same frontend/backend on a development machine without AKA hardware.
+
+Approach the only red object in a clean test scene:
+
+```bash
+./red_cloth_follow \
+  --camera /dev/cvi-usb-camera0 \
+  --motor /dev/ttyS1
+```
+
+This command reuses the existing YUV422P camera capture and motor UART code. It
+centres the red object, reduces forward speed as the red coverage grows, brakes
+after three consecutive full-view observations, and has a 120-second safety
+timeout. Forward speed, pulsed steering, and continuous search reuse the same helpers as the existing tennis-chase controller. Always validate colour thresholds and steering without motor output first:
+
+```bash
+./red_cloth_follow --dry-run --max-frames 300
+```
+
+The default full-view condition is either 70% red pixels, or at least 55% red
+pixels whose bounding box covers 95% of the frame width and 65% of its height.
+The second condition matches the actual container's wide aspect ratio measured
+on the 640x480 camera and prevents the robot from continuing forward after the
+container has already filled the horizontal field of view. Both conditions
+must hold for three consecutive frames. Use `--help` for threshold and safety
+limit options.

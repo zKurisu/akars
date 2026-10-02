@@ -48,7 +48,9 @@ fn main() {
     println!("2. FORWARD (speed=30) for 2s ...");
     motor.forward(30);
     println!("   -> wrote left+right CMD_SET_SPEED");
-    thread::sleep(Duration::from_millis(2000));
+    thread::sleep(Duration::from_millis(500));
+    print_status(&mut motor, "FORWARD");
+    thread::sleep(Duration::from_millis(1500));
 
     // Test 2: Stop
     println!("3. STANDBY ...");
@@ -59,17 +61,23 @@ fn main() {
     // Test 3: Backward
     println!("4. BACKWARD (speed=20) for 1.5s ...");
     motor.backward(20);
-    thread::sleep(Duration::from_millis(1500));
+    thread::sleep(Duration::from_millis(500));
+    print_status(&mut motor, "BACKWARD");
+    thread::sleep(Duration::from_millis(1000));
 
     // Test 4: Left turn
     println!("5. LEFT turn (speed=20) for 1s ...");
     motor.left(20);
-    thread::sleep(Duration::from_millis(1000));
+    thread::sleep(Duration::from_millis(500));
+    print_status(&mut motor, "LEFT");
+    thread::sleep(Duration::from_millis(500));
 
     // Test 5: Right turn
     println!("6. RIGHT turn (speed=20) for 1s ...");
     motor.right(20);
-    thread::sleep(Duration::from_millis(1000));
+    thread::sleep(Duration::from_millis(500));
+    print_status(&mut motor, "RIGHT");
+    thread::sleep(Duration::from_millis(500));
 
     // Test 6: Brake
     println!("7. BRAKE ...");
@@ -85,4 +93,13 @@ fn main() {
     println!("  - Try different UART: --motor /dev/ttyS1 (JTAG) or --motor /dev/ttyS3 (GPIOP)");
     println!("  - Check pinmux output above for routing errors");
     println!("  - Note: UART3 (/dev/ttyS3) shares pins with SDIO (WiFi)");
+}
+
+fn print_status(motor: &mut Motor, label: &str) {
+    match motor.status() {
+        Ok((state, left_rpm, right_rpm)) => {
+            println!("   {label} STATUS state={state} left_rpm={left_rpm} right_rpm={right_rpm}");
+        }
+        Err(error) => eprintln!("   {label} GET_STATUS failed: {error}"),
+    }
 }

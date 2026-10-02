@@ -69,6 +69,15 @@ const GRAB_CONFIRM_THRESHOLD: i32 = 2;
 const BACKWARD_SPEED: i32 = 16;
 const BACKWARD_PULSE_US: u64 = 80_000;
 
+/// Motor decision shared by the tennis hunter and any target follower that
+/// must move exactly like the original tennis chase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChaseMotion {
+    Forward(i32),
+    TurnLeft(u64),
+    TurnRight(u64),
+}
+
 pub fn install_signal_handlers() {
     unsafe {
         crate::linux::signal(crate::linux::SIGINT, signal_handler);
@@ -274,7 +283,7 @@ fn handle_detections(
         robot.grab_confirm_count = 0;
         robot.status = RobotStatus::ChaseTennis;
         // Continuous clockwise rotation while searching — no stop.
-        motor.drive(IDLE_SPEED, -IDLE_SPEED);
+        search_for_target(motor);
         return;
     }
 
@@ -290,11 +299,8 @@ fn handle_detections(
     let image_area = (image_w.max(1) * image_h.max(1)) as f32;
     let area_ratio = (best.bbox.w * best.bbox.h) / image_area;
     let ball_cx = best.bbox.x as i32;
-    let center = image_w / 2 + scaled_center_margin(image_w, GRAB_CENTER_OFFSET);
-    let center_margin = scaled_center_margin(image_w, CENTER_MARGIN);
-    let offset = ball_cx - center;
-    let centered = offset.abs() <= center_margin;
-    let pulse_us = turn_pulse_us(area_ratio);
+    let chase_motion = chase_motion(ball_cx, area_ratio, image_w);
+    let centered = matches!(chase_motion, ChaseMotion::Forward(_));
 
     robot.area_ratio = area_ratio;
     robot.ball_cx = ball_cx;
@@ -342,23 +348,42 @@ fn handle_detections(
         }
     } else if area_ratio >= GRAB_AREA && !centered {
         // Big but off-centre — align to centre the ball, keep progress.
-        align(offset, pulse_us, motor);
+        execute_chase_motion(chase_motion, motor);
     } else {
         // Ball is still far — chase.
         robot.grab_confirm_count = 0;
         robot.status = RobotStatus::ChaseTennis;
-        if centered {
-            motor.forward(chase_speed(area_ratio));
-        } else {
-            align(offset, pulse_us, motor);
-        }
+        execute_chase_motion(chase_motion, motor);
+    }
+}
+
+/// Reproduce the original tennis-chase steering decision from target geometry.
+/// `area_ratio` is the target bounding-box area divided by the frame area.
+pub fn chase_motion(target_cx: i32, area_ratio: f32, image_w: i32) -> ChaseMotion {
+    let center = image_w / 2 + scaled_center_margin(image_w, GRAB_CENTER_OFFSET);
+    let center_margin = scaled_center_margin(image_w, CENTER_MARGIN);
+    let offset = target_cx - center;
+    if offset.abs() <= center_margin {
+        ChaseMotion::Forward(chase_speed(area_ratio))
+    } else if offset < 0 {
+        ChaseMotion::TurnLeft(turn_pulse_us(area_ratio))
+    } else {
+        ChaseMotion::TurnRight(turn_pulse_us(area_ratio))
+    }
+}
+
+pub fn execute_chase_motion(motion: ChaseMotion, motor: &mut Motor) {
+    match motion {
+        ChaseMotion::Forward(speed) => motor.forward(speed),
+        ChaseMotion::TurnLeft(pulse_us) => align_target(-1, pulse_us, motor),
+        ChaseMotion::TurnRight(pulse_us) => align_target(1, pulse_us, motor),
     }
 }
 
 /// Progressively reduce forward speed as the target gets larger in frame.
 /// Uses a quadratic curve: far away stays at full CHASE_SPEED, but speed
 /// drops FAST as the ball fills the screen, preventing overshoot.
-fn chase_speed(area_ratio: f32) -> i32 {
+pub fn chase_speed(area_ratio: f32) -> i32 {
     if area_ratio >= GRAB_AREA {
         return 0; // close enough — stop
     }
@@ -372,7 +397,7 @@ fn chase_speed(area_ratio: f32) -> i32 {
     speed.max(6.0).round() as i32
 }
 
-fn align(offset: i32, pulse_us: u64, motor: &mut Motor) {
+fn align_target(offset: i32, pulse_us: u64, motor: &mut Motor) {
     if offset < 0 {
         motor.drive(-TURN_SPEED, TURN_SPEED);
     } else {
@@ -382,13 +407,18 @@ fn align(offset: i32, pulse_us: u64, motor: &mut Motor) {
     motor.standby();
 }
 
+/// Use the exact same continuous search motion as the tennis chase loop.
+pub fn search_for_target(motor: &mut Motor) {
+    motor.drive(IDLE_SPEED, -IDLE_SPEED);
+}
+
 fn scaled_center_margin(image_w: i32, base: i32) -> i32 {
     ((base as f32) * image_w as f32 / REFERENCE_FRAME_WIDTH)
         .round()
         .max(1.0) as i32
 }
 
-fn turn_pulse_us(area_ratio: f32) -> u64 {
+pub fn turn_pulse_us(area_ratio: f32) -> u64 {
     ((K_TURN_PULSE * area_ratio * 1000.0) as u64).clamp(TURN_PULSE_MIN_US, TURN_PULSE_MAX_US)
 }
 
