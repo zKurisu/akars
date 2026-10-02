@@ -1,7 +1,7 @@
 use crate::serial::SerialPort;
 use std::io;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Servo angle constants ───────────────────────────────────────────
 // Servo 0: base swing     (decrease = up, increase = down)
@@ -26,6 +26,13 @@ const S1_PUSH: f32 = 115.0; // servo1 pushes arm toward ball
 // ── Step 3: Open gripper wide + continue pushing ──
 const S2_OPEN: f32 = 180.0; // gripper fully open (was 150, wider for visibility)
 const S1_CONTINUE: f32 = 95.0; // servo1 keeps going down
+
+// Deposit-only angle. Keep S2_OPEN unchanged because it is part of the
+// field-verified five-step grab sequence. At the raised carrying pose the
+// gripper needs more travel to release a loaded ball reliably.
+const S2_DEPOSIT_OPEN: f32 = 200.0;
+const S2_DEPOSIT_MIN_ACTUAL: f32 = 190.0;
+const DEPOSIT_RELEASE_ATTEMPTS: usize = 3;
 
 // ── Step 4: Close gripper to grab ball ──
 const S2_CLOSE: f32 = 80.0; // gripper clamped closed (was 100, tighter grip)
@@ -114,6 +121,102 @@ impl Arm {
         self.set_angle(2, S2_OPEN, 800);
     }
 
+    /// Open the loaded gripper at the red container and verify servo 2's
+    /// reported position. This deliberately uses a separate deposit angle so
+    /// the existing grab sequence and all of its calibrated angles stay
+    /// untouched.
+    pub fn release_for_deposit_verified(&mut self) -> io::Result<f32> {
+        let mut last_error = None;
+
+        for attempt in 1..=DEPOSIT_RELEASE_ATTEMPTS {
+            eprintln!(
+                "AKARS_GRIPPER_RELEASE attempt={attempt}/{DEPOSIT_RELEASE_ATTEMPTS} servo=2 target_angle={S2_DEPOSIT_OPEN} chassis_stopped=1"
+            );
+            self.restore_torque(2);
+            sleep_ms(300);
+            self.set_angle(2, S2_DEPOSIT_OPEN, 1000);
+            sleep_ms(1500);
+
+            match self.read_angle(2) {
+                Ok(actual_angle) => {
+                    let reached = actual_angle >= S2_DEPOSIT_MIN_ACTUAL;
+                    eprintln!(
+                        "AKARS_GRIPPER_POSITION servo=2 target_angle={S2_DEPOSIT_OPEN} actual_angle={actual_angle:.1} minimum_angle={S2_DEPOSIT_MIN_ACTUAL} reached={}",
+                        i32::from(reached),
+                    );
+                    if reached {
+                        return Ok(actual_angle);
+                    }
+                    last_error = Some(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "servo 2 did not reach deposit-open position: actual={actual_angle:.1}, minimum={S2_DEPOSIT_MIN_ACTUAL:.1}"
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "AKARS_GRIPPER_POSITION servo=2 read_failed=1 attempt={attempt} error={error}"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "deposit release verification failed")
+        }))
+    }
+
+    /// Read the actual servo position using the controller's PRAD command.
+    pub fn read_angle(&mut self, servo_id: i32) -> io::Result<f32> {
+        let _ = self.port.discard_input()?;
+        let query = format!("#{servo_id:03}PRAD!");
+        self.port.write_all_drain(query.as_bytes())?;
+
+        let deadline = Instant::now() + Duration::from_millis(750);
+        let mut frame = Vec::with_capacity(16);
+        let mut last_parse_error = None;
+
+        while Instant::now() < deadline {
+            let Some(byte) = self.port.read_byte(Duration::from_millis(50))? else {
+                continue;
+            };
+
+            if byte == b'#' {
+                frame.clear();
+                frame.push(byte);
+                continue;
+            }
+            if frame.is_empty() {
+                continue;
+            }
+            frame.push(byte);
+            if frame.len() > 32 {
+                frame.clear();
+                continue;
+            }
+            if byte != b'!' {
+                continue;
+            }
+
+            match parse_position_response(&frame, servo_id) {
+                Ok(pulse) => return Ok(pulse_to_angle(pulse)),
+                Err(error) => {
+                    last_parse_error = Some(error);
+                    frame.clear();
+                }
+            }
+        }
+
+        Err(last_parse_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("servo {servo_id} position response timed out"),
+            )
+        }))
+    }
+
     /// Return arm to ready position (arm up, gripper open).
     pub fn grab_pos(&mut self) {
         self.set_angle(0, S0_READY, 1000);
@@ -143,18 +246,64 @@ fn angle_to_pulse(angle: f32) -> i32 {
     ((500.0 + (angle / ANGLE_MAX) * 2000.0).round() as i32).clamp(PULSE_MIN, PULSE_MAX)
 }
 
+fn pulse_to_angle(pulse: i32) -> f32 {
+    ((pulse.clamp(PULSE_MIN, PULSE_MAX) - PULSE_MIN) as f32 * ANGLE_MAX)
+        / (PULSE_MAX - PULSE_MIN) as f32
+}
+
+fn parse_position_response(response: &[u8], expected_servo: i32) -> io::Result<i32> {
+    if response.len() != 10
+        || response[0] != b'#'
+        || response[4] != b'P'
+        || response[9] != b'!'
+        || !response[1..4].iter().all(u8::is_ascii_digit)
+        || !response[5..9].iter().all(u8::is_ascii_digit)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed servo position response: {:?}", response),
+        ));
+    }
+
+    let servo = response[1..4]
+        .iter()
+        .fold(0i32, |value, digit| value * 10 + i32::from(digit - b'0'));
+    if servo != expected_servo {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("servo position response mismatch: expected={expected_servo}, actual={servo}"),
+        ));
+    }
+
+    Ok(response[5..9]
+        .iter()
+        .fold(0i32, |value, digit| value * 10 + i32::from(digit - b'0')))
+}
+
 fn sleep_ms(ms: u64) {
     thread::sleep(Duration::from_millis(ms));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::angle_to_pulse;
+    use super::{angle_to_pulse, parse_position_response, pulse_to_angle};
 
     #[test]
     fn converts_angles_to_pulses() {
         assert_eq!(angle_to_pulse(0.0), 500);
         assert_eq!(angle_to_pulse(270.0), 2500);
         assert_eq!(angle_to_pulse(135.0), 1500);
+    }
+
+    #[test]
+    fn parses_position_response() {
+        assert_eq!(parse_position_response(b"#002P1981!", 2).unwrap(), 1981);
+        assert!(parse_position_response(b"#001P1981!", 2).is_err());
+        assert!(parse_position_response(b"#002PRAD!", 2).is_err());
+    }
+
+    #[test]
+    fn converts_position_pulse_to_angle() {
+        assert!((pulse_to_angle(1981) - 199.935).abs() < 0.01);
     }
 }

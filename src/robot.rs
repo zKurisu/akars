@@ -105,11 +105,6 @@ const GRAB_CONFIRM_THRESHOLD: i32 = 2;
 const BACKWARD_SPEED: i32 = 16;
 const BACKWARD_PULSE_US: u64 = 80_000;
 const RED_CRAWL_SPEED: i32 = 6;
-// The arm UART protocol has no acknowledgement or position feedback. Under a
-// held-ball load one open command was not reliable enough in the field, so
-// repeat the unchanged calibrated release command and do not move the chassis
-// until both travel windows have elapsed.
-const RELEASE_COMMAND_SETTLE_US: u64 = 1_500_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RedMissionAction {
@@ -528,22 +523,27 @@ fn handle_red_container(
                 "AKARS_MISSION_TRANSITION from=ApproachRedContainer to=ReleaseTennis holding_ball=1"
             );
 
-            // The user-requested drop happens immediately from the existing
-            // post-grab carrying pose. Do not lower the arm first and do not
-            // change the calibrated gripper-open operation itself.
+            // The five-step grab sequence remains untouched. Deposit uses a
+            // separate wider angle and must read back servo 2's actual
+            // position before any chassis movement is allowed.
+            let actual_angle = match arm.release_for_deposit_verified() {
+                Ok(actual_angle) => actual_angle,
+                Err(error) => {
+                    eprintln!(
+                        "AKARS_GRIPPER_RELEASE_FAULT holding_ball=1 chassis_stopped=1 error={error}"
+                    );
+                    eprintln!(
+                        "AKARS_MISSION_HALT reason=gripper_release_unverified action=manual_stop_required"
+                    );
+                    while !stop_requested() {
+                        motor.standby();
+                        sleep_us(100_000);
+                    }
+                    return;
+                }
+            };
             eprintln!(
-                "AKARS_GRIPPER_RELEASE phase=first servo=2 angle=180 chassis_stopped=1"
-            );
-            arm.release();
-            sleep_us(RELEASE_COMMAND_SETTLE_US);
-            eprintln!(
-                "AKARS_GRIPPER_RELEASE phase=confirm servo=2 angle=180 chassis_stopped=1"
-            );
-            arm.release();
-            sleep_us(RELEASE_COMMAND_SETTLE_US);
-            eprintln!(
-                "AKARS_GRIPPER_RELEASE_COMPLETE servo=2 angle=180 hold_ms={} chassis_stopped=1",
-                RELEASE_COMMAND_SETTLE_US * 2 / 1000,
+                "AKARS_GRIPPER_RELEASE_COMPLETE servo=2 target_angle=200 actual_angle={actual_angle:.1} verified=1 chassis_stopped=1"
             );
 
             robot.mark_deposit_complete();
@@ -555,7 +555,7 @@ fn handle_red_container(
             }
             // Arm::grab() already left servos 0/1 in the raised ready pose.
             // Do not call grab_pos() here: it would command gripper servo 2
-            // back from fully-open 180 degrees to the 100-degree ready angle.
+            // back from deposit-open 200 degrees to the 100-degree ready angle.
             // Keep the gripper open and resume the original in-place search.
             eprintln!("AKARS_MISSION_ACTION action=turn_around_and_search direction=right");
             search_for_target(motor);
