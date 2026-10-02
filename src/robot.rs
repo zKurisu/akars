@@ -568,16 +568,20 @@ fn handle_red_container(
             robot.mark_deposit_complete();
             eprintln!("AKARS_MISSION_TRANSITION from=ReleaseTennis to=ChaseTennis holding_ball=0");
 
-            // The release sequence blocks capture for several seconds.
-            if let Err(error) = camera.re_init() {
-                eprintln!("[camera] re-init after release failed: {error}");
-            }
             // Servos 0/1 stay in the raised carrying pose. Servo 2 has already
             // returned directly from deposit-open 200 degrees to the original
             // 80-degree closed position; do not call grab_pos(), which would
             // replace that position with the 100-degree ready angle.
             eprintln!("AKARS_MISSION_ACTION action=turn_around_and_search direction=right");
             search_for_target(motor);
+
+            // Start the clockwise turn immediately. The release sequence has
+            // blocked capture for several seconds, so rebuild the camera
+            // pipeline while the chassis is already searching rather than
+            // delaying the turn until re-initialization finishes.
+            if let Err(error) = camera.re_init() {
+                eprintln!("[camera] re-init after release failed: {error}");
+            }
         }
     }
 }
