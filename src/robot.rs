@@ -1,5 +1,4 @@
 use crate::arm::{Arm, S2_DEPOSIT_RESTORE};
-use crate::camera::UsbCamera;
 use crate::detector::Detection;
 use crate::motor::Motor;
 use crate::red_target::{
@@ -7,7 +6,10 @@ use crate::red_target::{
     DEFAULT_RED_MINIMUM_PIXELS, DEFAULT_RED_STOP_AREA_RATIO, DEFAULT_RED_STOP_CONFIRM_FRAMES,
     DEFAULT_RED_STOP_HEIGHT_RATIO, DEFAULT_RED_STOP_MIN_AREA_RATIO, DEFAULT_RED_STOP_WIDTH_RATIO,
 };
-use crate::tpu::{InferTiming, InferenceConfig, YoloModel};
+use crate::tpu::{
+    AlignedPhysicalFrames, InferTiming, InferenceConfig, PhysicalPixelFormat, YoloModel,
+};
+use crate::vpss_pipeline::{VpssRgbPipeline, CAMERA_HEIGHT, CAMERA_WIDTH};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -89,12 +91,15 @@ const REFERENCE_FRAME_WIDTH: f32 = 640.0;
 /// Ball area ratio at which the robot should stop and grab.
 /// ~0.55 = ball fills the screen top-to-bottom at 640×480.
 const GRAB_AREA: f32 = 0.55;
-const CENTER_MARGIN: i32 = 35;
+// The original +/-35 px dead band combined with a 120 ms in-place turn made
+// the ball jump across the target centre between frames. Accept a wider
+// centred region and correct only the portion outside it with a short pulse.
+const CENTER_MARGIN: i32 = 55;
 /// Offset the "centred" target position to the right of image centre.
 /// 0 = dead centre, positive = rightward.  Unit: pixels at 640×480.
 const GRAB_CENTER_OFFSET: i32 = 25;
-const K_TURN_PULSE: f32 = 2500.0;
-const TURN_PULSE_MAX_US: u64 = 120_000;
+const BALL_TURN_PULSE_MIN_US: u64 = 15_000;
+const BALL_TURN_PULSE_MAX_US: u64 = 45_000;
 /// Only back up if the ball literally fills nearly the whole frame.
 const GRAB_AREA_MAX: f32 = 0.85;
 const CHASE_SPEED: i32 = 45;
@@ -104,11 +109,17 @@ const IDLE_SPEED: i32 = 12;
 // the next tennis ball instead of sweeping past it between captured frames.
 // Keep IDLE_SPEED unchanged for the existing chase/search behaviours.
 const POST_DEPOSIT_SEARCH_SPEED: i32 = 6;
-const TURN_PULSE_MIN_US: u64 = 25_000;
 const GRAB_CONFIRM_THRESHOLD: i32 = 2;
 const BACKWARD_SPEED: i32 = 16;
 const BACKWARD_PULSE_US: u64 = 80_000;
 const RED_CRAWL_SPEED: i32 = 6;
+// A wide red container often already covers the optical centre even when its
+// noisy bounding-box centre is offset. Give it a wider, bbox-aware dead band
+// and use short corrections so consecutive frames do not command opposite
+// 120 ms turns.
+const RED_CENTER_MARGIN: i32 = 70;
+const RED_TURN_PULSE_MIN_US: u64 = 25_000;
+const RED_TURN_PULSE_MAX_US: u64 = 60_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RedMissionAction {
@@ -144,7 +155,7 @@ pub fn stop_requested() -> bool {
 }
 
 pub fn run_tennis_hunter(
-    mut camera: UsbCamera,
+    mut pipeline: VpssRgbPipeline,
     mut model: YoloModel,
     mut motor: Motor,
     mut arm: Arm,
@@ -171,7 +182,7 @@ pub fn run_tennis_hunter(
         "[cfg] GRAB_AREA={:.3} GRAB_AREA_MAX={:.3} \
          CHASE_SPEED={CHASE_SPEED} CONFIRM={GRAB_CONFIRM_THRESHOLD} \
          IDLE={IDLE_SPEED} CENTER={CENTER_MARGIN}±{GRAB_CENTER_OFFSET} \
-         TURN_PULSE=[{TURN_PULSE_MIN_US}..{TURN_PULSE_MAX_US}]us \
+         BALL_TURN_PULSE=[{BALL_TURN_PULSE_MIN_US}..{BALL_TURN_PULSE_MAX_US}]us \
          RED_STOP={:.0}%x{:.0}% RED_CONFIRM={DEFAULT_RED_STOP_CONFIRM_FRAMES}",
         GRAB_AREA,
         GRAB_AREA_MAX,
@@ -189,8 +200,7 @@ pub fn run_tennis_hunter(
         let frame_start = Instant::now();
         frame_idx += 1;
 
-        let capture_start = Instant::now();
-        let frame = match camera.get_frame() {
+        let frame = match pipeline.next(2_000) {
             Ok(frame) => {
                 camera_errors = 0;
                 camera_recoveries = 0;
@@ -198,48 +208,26 @@ pub fn run_tennis_hunter(
             }
             Err(err) => {
                 camera_errors += 1;
-                eprintln!("[camera] failed to get frame (#{camera_errors}): {err}");
+                eprintln!("[camera-vpss] failed to acquire frame (#{camera_errors}): {err}");
                 if camera_errors >= 3 {
                     camera_recoveries += 1;
-                    if camera_recoveries == 1 {
-                        // Tier 1: INIT resets session and re-initializes.
-                        eprintln!(
-                            "[camera] {} consecutive errors, re-initializing ...",
-                            camera_errors
-                        );
-                        if let Err(e) = camera.re_init() {
-                            eprintln!("[camera] re-init failed: {e}");
-                            sleep_us(500_000);
-                        } else {
-                            eprintln!("[camera] re-init ok");
-                            camera_errors = 0;
-                        }
-                    } else if camera_recoveries == 2 {
-                        // Tier 2: close fd + reopen + INIT (close now clears session).
-                        eprintln!("[camera] re-init didn't help, closing and reopening device ...");
-                        match camera.reopen() {
-                            Ok(()) => {
-                                eprintln!("[camera] reopen ok");
-                                camera_errors = 0;
-                            }
-                            Err(e) => {
-                                eprintln!("[camera] reopen failed: {e}");
-                                sleep_us(500_000);
-                            }
-                        }
+                    let recovery = if camera_recoveries <= 2 {
+                        eprintln!("[camera-vpss] restarting asynchronous pipeline ...");
+                        pipeline.restart()
                     } else {
-                        // Tier 3: VBUS power-cycle (~2.5 s), the strongest recovery.
-                        eprintln!("[camera] reopen didn't help, power-cycling camera VBUS ...");
-                        match camera.hard_reset() {
-                            Ok(()) => {
-                                eprintln!("[camera] hard-reset ok");
-                                camera_errors = 0;
+                        eprintln!("[camera-vpss] power-cycling camera ...");
+                        pipeline.hard_reset()
+                    };
+                    match recovery {
+                        Ok(()) => {
+                            eprintln!("[camera-vpss] recovery ok");
+                            camera_errors = 0;
+                            if camera_recoveries > 2 {
                                 camera_recoveries = 0;
                             }
-                            Err(e) => {
-                                eprintln!("[camera] hard-reset also failed: {e}");
-                                sleep_us(1_000_000);
-                            }
+                        }
+                        Err(error) => {
+                            eprintln!("[camera-vpss] recovery failed: {error}");
                         }
                     }
                 }
@@ -247,37 +235,53 @@ pub fn run_tennis_hunter(
                 continue;
             }
         };
-        let capture_us = capture_start.elapsed().as_micros() as i64;
+        let capture_us = frame.camera_request_us as i64;
+        let vpss_wall_us = frame.vpss_wall_us as i64;
+        let vpss_hardware_us = frame.vpss_hardware_us as i64;
+        let sequence = frame.meta.sequence;
 
         let mut timing = InferTiming::default();
         let handle_start = Instant::now();
         if robot.may_approach_red() {
             handle_red_container(
-                &frame.pixels,
-                usize::from(frame.width),
-                usize::from(frame.height),
+                frame.yuv,
+                frame.yuv_width as usize,
+                frame.yuv_height as usize,
                 &mut robot,
                 &mut motor,
                 &mut arm,
-                &mut camera,
             );
         } else {
-            let detections = match model.infer_timed(&frame, config.inference, Some(&mut timing)) {
+            let frame_paddrs = [frame.physical_address];
+            // SAFETY: VpssRgbPipeline owns the destination ION allocation and
+            // keeps it live until this blocking inference and postprocess return.
+            let detections = match unsafe {
+                model.infer_aligned_physical_timed(
+                    AlignedPhysicalFrames {
+                        frame_paddrs: &frame_paddrs,
+                        pixel_format: PhysicalPixelFormat::RgbPlanar,
+                        source_width: CAMERA_WIDTH as i32,
+                        source_height: CAMERA_HEIGHT as i32,
+                    },
+                    config.inference,
+                    Some(&mut timing),
+                )
+            } {
                 Ok(detections) => detections,
                 Err(err) => {
-                    eprintln!("[detect] inference failed: {err}");
+                    eprintln!("[detect] aligned VPSS inference failed: {err}");
+                    motor.standby();
                     sleep_us(100_000);
                     continue;
                 }
             };
             handle_detections(
                 &detections,
-                frame.width as i32,
-                frame.height as i32,
+                CAMERA_WIDTH as i32,
+                CAMERA_HEIGHT as i32,
                 &mut robot,
                 &mut motor,
                 &mut arm,
-                &mut camera,
             );
         }
         let handle_us = handle_start.elapsed().as_micros() as i64;
@@ -285,8 +289,11 @@ pub fn run_tennis_hunter(
         let frame_time = frame_start.elapsed();
 
         eprintln!(
-            "[time] cap={:.1} pre={:.1}(dec={:.1} rsz={:.1}) fwd={:.1} post={:.1} handle={:.1} total={:.1} ms",
+            "[time] seq={} cap={:.1} vpss={:.1}(hw={:.1}) pre={:.1}(dec={:.1} rsz={:.1}) fwd={:.1} post={:.1} handle={:.1} total={:.1} ms",
+            sequence,
             capture_us as f32 / 1000.0,
+            vpss_wall_us as f32 / 1000.0,
+            vpss_hardware_us as f32 / 1000.0,
             timing.preprocess_us as f32 / 1000.0,
             timing.decode_us as f32 / 1000.0,
             timing.resize_us as f32 / 1000.0,
@@ -331,7 +338,6 @@ fn handle_detections(
     robot: &mut RobotState,
     motor: &mut Motor,
     arm: &mut Arm,
-    camera: &mut UsbCamera,
 ) {
     if detections.is_empty() {
         eprintln!("[detect] no ball detected, searching");
@@ -408,12 +414,6 @@ fn handle_detections(
             eprintln!(
                 "AKARS_MISSION_TRANSITION from=GrabTennis to=FindRedContainer holding_ball=1"
             );
-
-            // Grab is intentionally blocking and can starve camera capture.
-            // Reset it so the next capture doesn't get EIO.
-            if let Err(e) = camera.re_init() {
-                eprintln!("[camera] re-init after grab failed: {e}");
-            }
         }
     } else if area_ratio >= GRAB_AREA && !centered {
         // Big but off-centre — align to centre the ball, keep progress.
@@ -467,11 +467,7 @@ fn decide_red_action(
 
     robot.status = RobotStatus::ApproachRedContainer;
     robot.red_confirm_count = 0;
-    let motion = chase_motion(
-        red.center_x as i32,
-        red.area_ratio(),
-        red.frame_width as i32,
-    );
+    let motion = red_chase_motion(red);
     // Tennis motion stops at the grab distance. The red target must reach the
     // closer 100% x 98% condition, so keep crawling until that is confirmed.
     RedMissionAction::Chase(match motion {
@@ -487,7 +483,6 @@ fn handle_red_container(
     robot: &mut RobotState,
     motor: &mut Motor,
     arm: &mut Arm,
-    camera: &mut UsbCamera,
 ) {
     let observation = detect_red_yuv422p(yuv422p, width, height, RedThreshold::default());
     let action = decide_red_action(robot, observation);
@@ -549,24 +544,14 @@ fn handle_red_container(
             eprintln!(
                 "AKARS_GRIPPER_RELEASE_COMPLETE servo=2 target_angle=200 actual_angle={actual_angle:.1} verified=1 chassis_stopped=1"
             );
-            let closed_angle = match arm.close_after_deposit_verified() {
-                Ok(actual_angle) => actual_angle,
-                Err(error) => {
-                    eprintln!(
-                        "AKARS_GRIPPER_RESTORE_FAULT release_verified=1 chassis_stopped=1 error={error}"
-                    );
-                    eprintln!(
-                        "AKARS_MISSION_HALT reason=gripper_close_unverified action=manual_stop_required"
-                    );
-                    motor.standby();
-                    while !stop_requested() {
-                        sleep_us(100_000);
-                    }
-                    return;
-                }
-            };
+            // The ball is already released and verified. Send the relaxed
+            // 98-degree restore command, then start searching immediately;
+            // do not block chassis motion on a second position read. The
+            // gripper and chassis have independent UART controllers, so the
+            // restore and slow turn can safely run concurrently.
+            arm.set_angle(2, S2_DEPOSIT_RESTORE, 1000);
             eprintln!(
-                "AKARS_GRIPPER_RESTORE_COMPLETE servo=2 target_angle={S2_DEPOSIT_RESTORE} actual_angle={closed_angle:.1} verified=1 chassis_stopped=1"
+                "AKARS_GRIPPER_RESTORE_COMMAND servo=2 target_angle={S2_DEPOSIT_RESTORE} immediate_turn=1"
             );
 
             robot.mark_deposit_complete();
@@ -581,13 +566,9 @@ fn handle_red_container(
             );
             search_for_target_after_deposit(motor);
 
-            // Start the clockwise turn immediately. The release sequence has
-            // blocked capture for several seconds, so rebuild the camera
-            // pipeline while the chassis is already searching rather than
-            // delaying the turn until re-initialization finishes.
-            if let Err(error) = camera.re_init() {
-                eprintln!("[camera] re-init after release failed: {error}");
-            }
+            // The asynchronous camera worker kept capturing while the arm was
+            // blocked. The next iteration requests the newest sequence, so no
+            // synchronous camera re-initialization is needed here.
         }
     }
 }
@@ -601,9 +582,35 @@ pub fn chase_motion(target_cx: i32, area_ratio: f32, image_w: i32) -> ChaseMotio
     if offset.abs() <= center_margin {
         ChaseMotion::Forward(chase_speed(area_ratio))
     } else if offset < 0 {
-        ChaseMotion::TurnLeft(turn_pulse_us(area_ratio))
+        ChaseMotion::TurnLeft(ball_turn_pulse_us(offset, center_margin))
     } else {
-        ChaseMotion::TurnRight(turn_pulse_us(area_ratio))
+        ChaseMotion::TurnRight(ball_turn_pulse_us(offset, center_margin))
+    }
+}
+
+/// Steer toward the red container without the left/right oscillation caused
+/// by applying the small-ball controller to a large, noisy red bounding box.
+fn red_chase_motion(red: RedObservation) -> ChaseMotion {
+    let image_w = red.frame_width.max(1) as i32;
+    let target_cx = red.center_x as i32;
+    let center = image_w / 2 + scaled_center_margin(image_w, GRAB_CENTER_OFFSET);
+    let bbox_width = red.right.saturating_sub(red.left).saturating_add(1) as i32;
+    let center_margin = scaled_center_margin(image_w, RED_CENTER_MARGIN)
+        .max(bbox_width / 4)
+        .min(image_w / 3);
+    let offset = target_cx - center;
+
+    if offset.abs() <= center_margin {
+        ChaseMotion::Forward(RED_CRAWL_SPEED)
+    } else {
+        let excess = offset.abs().saturating_sub(center_margin) as u64;
+        let pulse_us = (RED_TURN_PULSE_MIN_US + excess.saturating_mul(300))
+            .clamp(RED_TURN_PULSE_MIN_US, RED_TURN_PULSE_MAX_US);
+        if offset < 0 {
+            ChaseMotion::TurnLeft(pulse_us)
+        } else {
+            ChaseMotion::TurnRight(pulse_us)
+        }
     }
 }
 
@@ -658,8 +665,10 @@ fn scaled_center_margin(image_w: i32, base: i32) -> i32 {
         .max(1.0) as i32
 }
 
-pub fn turn_pulse_us(area_ratio: f32) -> u64 {
-    ((K_TURN_PULSE * area_ratio * 1000.0) as u64).clamp(TURN_PULSE_MIN_US, TURN_PULSE_MAX_US)
+fn ball_turn_pulse_us(offset: i32, center_margin: i32) -> u64 {
+    let excess = offset.abs().saturating_sub(center_margin) as u64;
+    (BALL_TURN_PULSE_MIN_US + excess.saturating_mul(180))
+        .clamp(BALL_TURN_PULSE_MIN_US, BALL_TURN_PULSE_MAX_US)
 }
 
 fn sleep_us(us: u64) {
@@ -669,9 +678,9 @@ fn sleep_us(us: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_red_action, scaled_center_margin, turn_pulse_us, ChaseMotion, RedMissionAction,
-        RobotState, RobotStatus, DEFAULT_RED_STOP_CONFIRM_FRAMES, TURN_PULSE_MAX_US,
-        TURN_PULSE_MIN_US,
+        ball_turn_pulse_us, chase_motion, decide_red_action, scaled_center_margin, ChaseMotion,
+        RedMissionAction, RobotState, RobotStatus, BALL_TURN_PULSE_MAX_US, BALL_TURN_PULSE_MIN_US,
+        DEFAULT_RED_STOP_CONFIRM_FRAMES,
     };
     use crate::red_target::RedObservation;
 
@@ -701,8 +710,17 @@ mod tests {
 
     #[test]
     fn clamps_turn_pulse() {
-        assert_eq!(turn_pulse_us(0.0), TURN_PULSE_MIN_US);
-        assert_eq!(turn_pulse_us(100.0), TURN_PULSE_MAX_US);
+        assert_eq!(ball_turn_pulse_us(55, 55), BALL_TURN_PULSE_MIN_US);
+        assert_eq!(ball_turn_pulse_us(1_000, 55), BALL_TURN_PULSE_MAX_US);
+    }
+
+    #[test]
+    fn logged_ball_centres_do_not_immediately_reverse() {
+        let ChaseMotion::TurnRight(pulse_us) = chase_motion(418, 0.080, 640) else {
+            panic!("cx=418 must make a short right correction");
+        };
+        assert!(pulse_us <= 20_000);
+        assert_eq!(chase_motion(303, 0.076, 640), ChaseMotion::Forward(33));
     }
 
     #[test]
@@ -736,6 +754,35 @@ mod tests {
             RedMissionAction::Chase(ChaseMotion::Forward(_))
         ));
         assert_eq!(robot.status, RobotStatus::ApproachRedContainer);
+    }
+
+    #[test]
+    fn wide_red_bbox_does_not_oscillate_on_noisy_center() {
+        let mut robot = RobotState::default();
+        robot.mark_grab_complete();
+
+        // This geometry matches the wide container boxes seen in the field
+        // log. Although the bbox centre is right of the old narrow dead band,
+        // the container already covers the optical centre and should advance.
+        let wide_right = red_observation(160, 140, 639, 339);
+        assert_eq!(
+            decide_red_action(&mut robot, Some(wide_right)),
+            RedMissionAction::Chase(ChaseMotion::Forward(super::RED_CRAWL_SPEED))
+        );
+    }
+
+    #[test]
+    fn narrow_off_axis_red_bbox_uses_short_correction() {
+        let mut robot = RobotState::default();
+        robot.mark_grab_complete();
+
+        let far_right = red_observation(500, 140, 620, 339);
+        let RedMissionAction::Chase(ChaseMotion::TurnRight(pulse_us)) =
+            decide_red_action(&mut robot, Some(far_right))
+        else {
+            panic!("right-side red target must turn right");
+        };
+        assert!((super::RED_TURN_PULSE_MIN_US..=super::RED_TURN_PULSE_MAX_US).contains(&pulse_us));
     }
 
     #[test]

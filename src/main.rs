@@ -2,7 +2,8 @@ use akars::arm::Arm;
 use akars::camera::UsbCamera;
 use akars::motor::{Motor, MotorConfig};
 use akars::robot::{install_signal_handlers, run_tennis_hunter, RobotConfig};
-use akars::tpu::{open_model, InferenceConfig};
+use akars::tpu::{open_model, InferenceConfig, PhysicalPixelFormat};
+use akars::vpss_pipeline::VpssRgbPipeline;
 use akars::web::{serve, WebConfig};
 use std::env;
 use std::net::SocketAddr;
@@ -12,6 +13,7 @@ use std::path::PathBuf;
 struct Cli {
     model: PathBuf,
     camera: String,
+    vpss: String,
     motor: String,
     arm: String,
     frames: Option<u64>,
@@ -55,6 +57,7 @@ impl Default for Cli {
         Self {
             model: PathBuf::new(),
             camera: "/dev/cvi-usb-camera0".to_string(),
+            vpss: "/dev/cvi-vpss0".to_string(),
             motor: "/dev/ttyS1".to_string(),
             arm: "/dev/ttyS2".to_string(),
             frames: None,
@@ -119,24 +122,6 @@ fn main() {
 }
 
 fn run_hunt(cli: Cli) {
-    let mut camera = match UsbCamera::open(&cli.camera) {
-        Ok(camera) => {
-            let info = camera.info();
-            eprintln!(
-                "[camera] opened {}: {}x{} format={} connected={}",
-                cli.camera, info.width, info.height, info.format, info.connected
-            );
-            camera
-        }
-        Err(err) => {
-            eprintln!("[camera] failed to open {}: {err}", cli.camera);
-            std::process::exit(1);
-        }
-    };
-
-    // One-time diagnostic: compare raw MJPEG vs JPU-decoded YUV timing.
-    camera.diagnose_timing();
-
     let model = match open_model(&cli.model) {
         Ok(model) => model,
         Err(err) => {
@@ -144,7 +129,51 @@ fn run_hunt(cli: Cli) {
             std::process::exit(1);
         }
     };
-    eprintln!("[dbg] model opened, opening motor {} ...", cli.motor);
+    let contract = model.input_contract();
+    eprintln!("{}", contract.summary());
+    let contract_ok = contract.aligned
+        && contract.format == 7
+        && contract.pixel_format == PhysicalPixelFormat::RgbPlanar as i32
+        && (contract.qscale - 1.0).abs() <= 1.0e-6
+        && contract.zero_point == 0
+        && contract.mean.iter().all(|value| value.abs() <= 1.0e-6)
+        && contract
+            .scale
+            .iter()
+            .all(|value| (*value - 1.0).abs() <= 1.0e-6);
+    if !contract_ok {
+        eprintln!(
+            "[tpu] model is incompatible with VPSS zero-copy input; expected aligned UINT8 RGB_PLANAR, qscale=1, zero_point=0, mean=0, scale=1"
+        );
+        std::process::exit(1);
+    }
+    let (input_w, input_h) = model.input_dimensions();
+    let output_w = u32::try_from(input_w).unwrap_or_else(|_| {
+        eprintln!("[tpu] invalid model input width: {input_w}");
+        std::process::exit(1);
+    });
+    let output_h = u32::try_from(input_h).unwrap_or_else(|_| {
+        eprintln!("[tpu] invalid model input height: {input_h}");
+        std::process::exit(1);
+    });
+    let pipeline = match VpssRgbPipeline::open(&cli.camera, &cli.vpss, output_w, output_h) {
+        Ok(pipeline) => pipeline,
+        Err(err) => {
+            eprintln!(
+                "[camera-vpss] failed to open camera={} vpss={}: {err}",
+                cli.camera, cli.vpss
+            );
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "[camera-vpss] opened camera={} vpss={} output={}x{}",
+        cli.camera, cli.vpss, output_w, output_h
+    );
+    eprintln!(
+        "[dbg] model and VPSS opened, opening motor {} ...",
+        cli.motor
+    );
 
     let motor_config = MotorConfig {
         device: cli.motor.clone(),
@@ -177,7 +206,7 @@ fn run_hunt(cli: Cli) {
         max_frames: cli.frames,
     };
 
-    run_tennis_hunter(camera, model, motor, arm, config);
+    run_tennis_hunter(pipeline, model, motor, arm, config);
 }
 
 fn run_detect(cli: DetectCli) {
@@ -318,6 +347,7 @@ fn parse_hunt_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                 std::process::exit(0);
             }
             "--camera" => cli.camera = take_value(&mut args, "--camera")?,
+            "--vpss" => cli.vpss = take_value(&mut args, "--vpss")?,
             "--motor" => cli.motor = take_value(&mut args, "--motor")?,
             "--arm" => cli.arm = take_value(&mut args, "--arm")?,
             "--frames" => {
@@ -377,9 +407,7 @@ fn parse_serve_cli(args: impl Iterator<Item = String>) -> Result<WebConfig, Stri
             }
             "--motor" => config.motor_device = take_value(&mut args, "--motor")?,
             "--arm" => config.arm_device = take_value(&mut args, "--arm")?,
-            "--camera" => {
-                config.camera_device = Some(take_value(&mut args, "--camera")?)
-            }
+            "--camera" => config.camera_device = Some(take_value(&mut args, "--camera")?),
             "--mock" => config.mock = true,
             value if value.starts_with('-') => {
                 return Err(format!("unknown serve option: {value}"))
@@ -481,7 +509,7 @@ fn take_value(
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  akars <model.cvimodel> [--camera DEV] [--motor DEV] [--arm DEV] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n\nNote: motor defaults to /dev/ttyS1 (JTAG pads). Use --motor /dev/ttyS3 for\nGPIOP UART3, but this will disconnect WiFi (shared SDIO pins)."
+        "Usage:\n  akars <aligned-model.cvimodel> [--camera DEV] [--vpss DEV] [--motor DEV] [--arm DEV] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n\nNote: motor defaults to /dev/ttyS1 (JTAG pads). Use --motor /dev/ttyS3 for\nGPIOP UART3, but this will disconnect WiFi (shared SDIO pins)."
     );
 }
 

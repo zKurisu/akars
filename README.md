@@ -68,11 +68,14 @@ scripts/upload.sh /dev/sda2
 Run on device:
 
 ```bash
-./akars /path/to/yolo_model.cvimodel \
+./akars /akars_tennis/model/yolov8n_tennis_p2_384_aligned_int8.cvimodel \
   --camera /dev/cvi-usb-camera0 \
-  --motor /dev/ttyS3 \
+  --vpss /dev/cvi-vpss0 \
+  --motor /dev/ttyS1 \
   --arm /dev/ttyS2
 ```
+
+The autonomous hunt path requires an aligned, fused-preprocess UINT8 RGB-planar model. Camera MJPEG is decoded by JPU into an ION YUV422P buffer, VPSS performs letterbox and colour conversion into an RGB-planar ION buffer, and the TPU runtime binds that physical buffer directly. The older non-aligned yolov8n_tennis_v2.cvimodel remains usable by detect, but hunt deliberately rejects it so the controller cannot silently fall back to CPU preprocessing.
 
 The autonomous mission is cyclic: chase and grab a tennis ball, search for the
 red container only after the grab completes, approach until its bounding box

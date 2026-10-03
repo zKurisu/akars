@@ -35,6 +35,50 @@ pub struct InferTiming {
     pub postprocess_us: i64,
 }
 
+/// Runtime-observed model input contract used to guard the VPSS fast path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InputTensorContract {
+    pub shape: [i32; 4],
+    pub dim_size: usize,
+    pub format: i32,
+    pub count: usize,
+    pub mem_size: usize,
+    pub physical_address: u64,
+    pub mem_type: i32,
+    pub qscale: f32,
+    pub zero_point: i32,
+    pub pixel_format: i32,
+    pub aligned: bool,
+    pub mean: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+impl InputTensorContract {
+    pub fn summary(self) -> String {
+        format!(
+            "AKARS_TPU_INPUT shape={}x{}x{}x{} dim_size={} format={} count={} mem_size={} paddr=0x{:x} mem_type={} pixel_format={} aligned={} qscale={:.6} zero_point={} mean={:.3},{:.3},{:.3} scale={:.3},{:.3},{:.3}",
+            self.shape[0], self.shape[1], self.shape[2], self.shape[3], self.dim_size,
+            self.format, self.count, self.mem_size, self.physical_address, self.mem_type,
+            self.pixel_format, u8::from(self.aligned), self.qscale, self.zero_point,
+            self.mean[0], self.mean[1], self.mean[2], self.scale[0], self.scale[1], self.scale[2],
+        )
+    }
+}
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalPixelFormat {
+    RgbPlanar = 2,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AlignedPhysicalFrames<'a> {
+    pub frame_paddrs: &'a [u64],
+    pub pixel_format: PhysicalPixelFormat,
+    pub source_width: i32,
+    pub source_height: i32,
+}
+
 #[derive(Debug)]
 pub struct TpuError(String);
 
@@ -54,7 +98,10 @@ impl Error for TpuError {}
 
 #[cfg(target_arch = "riscv64")]
 mod imp {
-    use super::{CameraFrame, Detection, InferTiming, InferenceConfig, TpuError};
+    use super::{
+        AlignedPhysicalFrames, CameraFrame, Detection, InferTiming, InferenceConfig,
+        InputTensorContract, TpuError,
+    };
     use crate::detector::{correct_yolo_boxes, nms, parse_yolov8_output};
     use crate::image_bridge;
     use std::ffi::{c_char, c_int, c_void, CString};
@@ -118,6 +165,12 @@ mod imp {
         ) -> *mut CviTensor;
         fn CVI_NN_TensorPtr(tensor: *mut CviTensor) -> *mut c_void;
         fn CVI_NN_TensorShape(tensor: *mut CviTensor) -> CviShape;
+        fn CVI_NN_SetTensorWithAlignedFrames(
+            tensor: *mut CviTensor,
+            frame_paddrs: *mut u64,
+            frame_num: i32,
+            pixel_format: i32,
+        ) -> i32;
         fn CVI_NN_Forward(
             model: CviModelHandle,
             inputs: *mut CviTensor,
@@ -208,6 +261,108 @@ mod imp {
                 output_shapes,
                 preprocessor: image_bridge::ImagePreprocessor::new(),
             })
+        }
+
+        pub fn input_contract(&self) -> InputTensorContract {
+            let tensor = unsafe { &*self.input };
+            InputTensorContract {
+                shape: [
+                    tensor.shape.dim[0],
+                    tensor.shape.dim[1],
+                    tensor.shape.dim[2],
+                    tensor.shape.dim[3],
+                ],
+                dim_size: tensor.shape.dim_size,
+                format: tensor.fmt,
+                count: tensor.count,
+                mem_size: tensor.mem_size,
+                physical_address: tensor.paddr,
+                mem_type: tensor.mem_type,
+                qscale: tensor.qscale,
+                zero_point: tensor.zero_point,
+                pixel_format: tensor.pixel_format,
+                aligned: tensor.aligned,
+                mean: tensor.mean,
+                scale: tensor.scale,
+            }
+        }
+
+        pub const fn input_dimensions(&self) -> (i32, i32) {
+            (self.input_w, self.input_h)
+        }
+
+        /// Bind one VPSS-produced RGB-planar ION frame to an aligned model.
+        ///
+        /// # Safety
+        ///
+        /// The physical buffer must remain DMA-visible and live until this
+        /// blocking inference returns.
+        pub unsafe fn infer_aligned_physical_timed(
+            &mut self,
+            frames: AlignedPhysicalFrames<'_>,
+            config: InferenceConfig,
+            mut timing: Option<&mut InferTiming>,
+        ) -> Result<Vec<Detection>, TpuError> {
+            if frames.frame_paddrs.len() != 1 || frames.frame_paddrs[0] == 0 {
+                return Err(TpuError::new(
+                    "aligned inference requires exactly one non-zero physical frame",
+                ));
+            }
+            if frames.source_width <= 0 || frames.source_height <= 0 {
+                return Err(TpuError::new("source dimensions must be positive"));
+            }
+            let input = unsafe { &*self.input };
+            if !input.aligned {
+                return Err(TpuError::new(
+                    "model input is not aligned; use the aligned CVI model",
+                ));
+            }
+            if input.pixel_format != frames.pixel_format as i32 {
+                return Err(TpuError::new(format!(
+                    "physical frame format mismatch: model={} frame={}",
+                    input.pixel_format, frames.pixel_format as i32
+                )));
+            }
+            if input.fmt != CVI_FMT_UINT8 {
+                return Err(TpuError::new(format!(
+                    "aligned VPSS input requires UINT8 tensor format, got {}",
+                    input.fmt
+                )));
+            }
+            let bytes = rgb_tensor_len(self.input_w, self.input_h)?;
+            let last = frames.frame_paddrs[0]
+                .checked_add((bytes - 1) as u64)
+                .ok_or_else(|| TpuError::new("VPSS physical range overflow"))?;
+            if last > u64::from(u32::MAX) {
+                return Err(TpuError::new("VPSS physical range exceeds SG2002 DMA32"));
+            }
+
+            let rc = unsafe {
+                CVI_NN_SetTensorWithAlignedFrames(
+                    self.input,
+                    frames.frame_paddrs.as_ptr().cast_mut(),
+                    1,
+                    frames.pixel_format as i32,
+                )
+            };
+            if rc != CVI_RC_SUCCESS {
+                return Err(TpuError::new(format!(
+                    "CVI_NN_SetTensorWithAlignedFrames failed: {rc}"
+                )));
+            }
+
+            let (detections, forward_us, postprocess_us) =
+                self.forward_and_detections(config, frames.source_width, frames.source_height)?;
+            if let Some(t) = timing.as_deref_mut() {
+                *t = InferTiming {
+                    decode_us: 0,
+                    resize_us: 0,
+                    preprocess_us: 0,
+                    forward_us,
+                    postprocess_us,
+                };
+            }
+            Ok(detections)
         }
 
         pub fn infer(
@@ -339,7 +494,10 @@ mod imp {
             );
             let input = unsafe { slice::from_raw_parts_mut(input_ptr, input_len) };
 
-            eprintln!("[detect] step 2: mjpeg_to_rgb_planar (image={} bytes) ...", image.len());
+            eprintln!(
+                "[detect] step 2: mjpeg_to_rgb_planar (image={} bytes) ...",
+                image.len()
+            );
             let preprocess = self
                 .preprocessor
                 .mjpeg_to_rgb_planar(image, input, self.input_w, self.input_h)
@@ -364,7 +522,10 @@ mod imp {
             let (detections, _, _) = self.forward_and_detections(config, image_w, image_h)?;
             eprintln!("[detect] step 3 ok: {} detections", detections.len());
 
-            eprintln!("[detect] step 4: draw_detections → {} ...", out_path.display());
+            eprintln!(
+                "[detect] step 4: draw_detections → {} ...",
+                out_path.display()
+            );
             image_bridge::draw_detections(image, &detections, out_path)
                 .map_err(|err| TpuError::new(format!("failed to write annotated image: {err}")))?;
             eprintln!("[detect] step 4 ok");
@@ -424,10 +585,16 @@ mod imp {
         ptr: *mut c_void,
         count: usize,
     ) -> Result<Vec<f32>, TpuError> {
-        eprintln!("[tpu] tensor_to_f32: fmt={} count={} ptr={:p}", tensor.fmt, count, ptr);
+        eprintln!(
+            "[tpu] tensor_to_f32: fmt={} count={} ptr={:p}",
+            tensor.fmt, count, ptr
+        );
         match tensor.fmt {
             CVI_FMT_FP32 => {
-                eprintln!("[tpu] tensor_to_f32: FP32 path, reading {} f32s from {:p}", count, ptr);
+                eprintln!(
+                    "[tpu] tensor_to_f32: FP32 path, reading {} f32s from {:p}",
+                    count, ptr
+                );
                 let src = unsafe { slice::from_raw_parts(ptr as *const f32, count) };
                 Ok(src.to_vec())
             }
@@ -469,7 +636,10 @@ mod imp {
 
 #[cfg(not(target_arch = "riscv64"))]
 mod imp {
-    use super::{CameraFrame, Detection, InferTiming, InferenceConfig, TpuError};
+    use super::{
+        AlignedPhysicalFrames, CameraFrame, Detection, InferTiming, InferenceConfig,
+        InputTensorContract, TpuError,
+    };
     use std::path::Path;
 
     pub struct YoloModel;
@@ -478,6 +648,28 @@ mod imp {
         pub fn open(_path: &Path) -> Result<Self, TpuError> {
             Err(TpuError::new(
                 "akars was built without SG2002 TPU runtime support",
+            ))
+        }
+
+        pub fn input_contract(&self) -> InputTensorContract {
+            unreachable!("host TPU stub cannot own a model")
+        }
+
+        pub fn input_dimensions(&self) -> (i32, i32) {
+            unreachable!("host TPU stub cannot own a model")
+        }
+
+        /// # Safety
+        ///
+        /// The host stub never dereferences the supplied physical address.
+        pub unsafe fn infer_aligned_physical_timed(
+            &mut self,
+            _frames: AlignedPhysicalFrames<'_>,
+            _config: InferenceConfig,
+            _timing: Option<&mut InferTiming>,
+        ) -> Result<Vec<Detection>, TpuError> {
+            Err(TpuError::new(
+                "aligned physical inference requires SG2002 TPU runtime support",
             ))
         }
 

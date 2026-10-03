@@ -9,4 +9,5 @@ pub mod red_target;
 pub mod robot;
 pub mod serial;
 pub mod tpu;
+pub mod vpss_pipeline;
 pub mod web;
