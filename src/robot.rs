@@ -1,4 +1,4 @@
-use crate::arm::Arm;
+use crate::arm::{Arm, S2_DEPOSIT_RESTORE};
 use crate::camera::UsbCamera;
 use crate::detector::Detection;
 use crate::motor::Motor;
@@ -100,6 +100,10 @@ const GRAB_AREA_MAX: f32 = 0.85;
 const CHASE_SPEED: i32 = 45;
 const TURN_SPEED: i32 = 10;
 const IDLE_SPEED: i32 = 12;
+// After depositing a ball, rotate slowly enough that the camera can acquire
+// the next tennis ball instead of sweeping past it between captured frames.
+// Keep IDLE_SPEED unchanged for the existing chase/search behaviours.
+const POST_DEPOSIT_SEARCH_SPEED: i32 = 6;
 const TURN_PULSE_MIN_US: u64 = 25_000;
 const GRAB_CONFIRM_THRESHOLD: i32 = 2;
 const BACKWARD_SPEED: i32 = 16;
@@ -562,18 +566,20 @@ fn handle_red_container(
                 }
             };
             eprintln!(
-                "AKARS_GRIPPER_RESTORE_COMPLETE servo=2 target_angle=80 actual_angle={closed_angle:.1} verified=1 chassis_stopped=1"
+                "AKARS_GRIPPER_RESTORE_COMPLETE servo=2 target_angle={S2_DEPOSIT_RESTORE} actual_angle={closed_angle:.1} verified=1 chassis_stopped=1"
             );
 
             robot.mark_deposit_complete();
             eprintln!("AKARS_MISSION_TRANSITION from=ReleaseTennis to=ChaseTennis holding_ball=0");
 
             // Servos 0/1 stay in the raised carrying pose. Servo 2 has already
-            // returned directly from deposit-open 200 degrees to the original
-            // 80-degree closed position; do not call grab_pos(), which would
-            // replace that position with the 100-degree ready angle.
-            eprintln!("AKARS_MISSION_ACTION action=turn_around_and_search direction=right");
-            search_for_target(motor);
+            // returned directly from deposit-open 200 degrees to the relaxed
+            // deposit-only 98-degree position. The original 80-degree clamp
+            // remains reserved for grabbing or holding a tennis ball.
+            eprintln!(
+                "AKARS_MISSION_ACTION action=turn_around_and_search direction=right speed={POST_DEPOSIT_SEARCH_SPEED}"
+            );
+            search_for_target_after_deposit(motor);
 
             // Start the clockwise turn immediately. The release sequence has
             // blocked capture for several seconds, so rebuild the camera
@@ -639,6 +645,11 @@ fn align_target(offset: i32, pulse_us: u64, motor: &mut Motor) {
 /// Use the exact same continuous search motion as the tennis chase loop.
 pub fn search_for_target(motor: &mut Motor) {
     motor.drive(IDLE_SPEED, -IDLE_SPEED);
+}
+
+/// Slow clockwise search used only immediately after depositing a ball.
+fn search_for_target_after_deposit(motor: &mut Motor) {
+    motor.drive(POST_DEPOSIT_SEARCH_SPEED, -POST_DEPOSIT_SEARCH_SPEED);
 }
 
 fn scaled_center_margin(image_w: i32, base: i32) -> i32 {

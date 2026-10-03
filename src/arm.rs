@@ -32,6 +32,10 @@ const S1_CONTINUE: f32 = 95.0; // servo1 keeps going down
 // gripper needs more travel to release a loaded ball reliably.
 const S2_DEPOSIT_OPEN: f32 = 200.0;
 const S2_DEPOSIT_MIN_ACTUAL: f32 = 190.0;
+// Deposit-only restore angle. Do not reuse S2_CLOSE here: 80 degrees is the
+// tight clamp required while grabbing or carrying a tennis ball. After the
+// drop, the empty gripper only needs to return to a relaxed closed pose.
+pub(crate) const S2_DEPOSIT_RESTORE: f32 = 98.0;
 // The loaded servo reported 91.4 degrees after a commanded 80-degree close.
 // The existing 100-degree ready position is already mechanically closed
 // enough, so accept the full calibrated closed range instead of rejecting a
@@ -172,18 +176,21 @@ impl Arm {
             io::Error::new(io::ErrorKind::Other, "deposit release verification failed")
         }))
     }
-    /// Return the gripper to the original 80-degree closed position as soon
-    /// as the deposited ball has been released. Chassis movement remains
-    /// inhibited until servo 2 reports that it has closed again.
+    /// Return the empty gripper to the relaxed 98-degree closed position as
+    /// soon as the deposited ball has been released. Chassis movement remains
+    /// inhibited until servo 2 reports that it has closed again. The tighter
+    /// S2_CLOSE angle remains reserved for grab/ball-holding operations.
     pub fn close_after_deposit_verified(&mut self) -> io::Result<f32> {
-        eprintln!("AKARS_GRIPPER_RESTORE servo=2 target_angle={S2_CLOSE} chassis_stopped=1");
-        self.set_angle(2, S2_CLOSE, 1000);
+        eprintln!(
+            "AKARS_GRIPPER_RESTORE servo=2 target_angle={S2_DEPOSIT_RESTORE} chassis_stopped=1"
+        );
+        self.set_angle(2, S2_DEPOSIT_RESTORE, 1000);
         sleep_ms(1500);
 
         let actual_angle = self.read_angle(2)?;
         let reached = deposit_close_reached(actual_angle);
         eprintln!(
-            "AKARS_GRIPPER_RESTORE_POSITION servo=2 target_angle={S2_CLOSE} actual_angle={actual_angle:.1} maximum_angle={S2_DEPOSIT_CLOSE_MAX_ACTUAL} reached={}",
+            "AKARS_GRIPPER_RESTORE_POSITION servo=2 target_angle={S2_DEPOSIT_RESTORE} actual_angle={actual_angle:.1} maximum_angle={S2_DEPOSIT_CLOSE_MAX_ACTUAL} reached={}",
             i32::from(reached),
         );
         if reached {
