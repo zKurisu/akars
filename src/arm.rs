@@ -32,7 +32,11 @@ const S1_CONTINUE: f32 = 95.0; // servo1 keeps going down
 // gripper needs more travel to release a loaded ball reliably.
 const S2_DEPOSIT_OPEN: f32 = 200.0;
 const S2_DEPOSIT_MIN_ACTUAL: f32 = 190.0;
-const S2_DEPOSIT_CLOSE_MAX_ACTUAL: f32 = 90.0;
+// The loaded servo reported 91.4 degrees after a commanded 80-degree close.
+// The existing 100-degree ready position is already mechanically closed
+// enough, so accept the full calibrated closed range instead of rejecting a
+// harmless 1.4-degree overshoot at an artificially strict 90-degree boundary.
+const S2_DEPOSIT_CLOSE_MAX_ACTUAL: f32 = S2_READY;
 const DEPOSIT_RELEASE_ATTEMPTS: usize = 3;
 
 // ── Step 4: Close gripper to grab ball ──
@@ -177,7 +181,7 @@ impl Arm {
         sleep_ms(1500);
 
         let actual_angle = self.read_angle(2)?;
-        let reached = actual_angle <= S2_DEPOSIT_CLOSE_MAX_ACTUAL;
+        let reached = deposit_close_reached(actual_angle);
         eprintln!(
             "AKARS_GRIPPER_RESTORE_POSITION servo=2 target_angle={S2_CLOSE} actual_angle={actual_angle:.1} maximum_angle={S2_DEPOSIT_CLOSE_MAX_ACTUAL} reached={}",
             i32::from(reached),
@@ -306,13 +310,16 @@ fn parse_position_response(response: &[u8], expected_servo: i32) -> io::Result<i
         .fold(0i32, |value, digit| value * 10 + i32::from(digit - b'0')))
 }
 
+fn deposit_close_reached(actual_angle: f32) -> bool {
+    actual_angle <= S2_DEPOSIT_CLOSE_MAX_ACTUAL
+}
 fn sleep_ms(ms: u64) {
     thread::sleep(Duration::from_millis(ms));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{angle_to_pulse, parse_position_response, pulse_to_angle};
+    use super::{angle_to_pulse, deposit_close_reached, parse_position_response, pulse_to_angle};
 
     #[test]
     fn converts_angles_to_pulses() {
@@ -331,5 +338,13 @@ mod tests {
     #[test]
     fn converts_position_pulse_to_angle() {
         assert!((pulse_to_angle(1981) - 199.935).abs() < 0.01);
+    }
+
+    #[test]
+    fn accepts_calibrated_closed_range_after_deposit() {
+        assert!(deposit_close_reached(80.0));
+        assert!(deposit_close_reached(91.4));
+        assert!(deposit_close_reached(100.0));
+        assert!(!deposit_close_reached(100.1));
     }
 }

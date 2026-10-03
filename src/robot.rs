@@ -535,8 +535,8 @@ fn handle_red_container(
                     eprintln!(
                         "AKARS_MISSION_HALT reason=gripper_release_unverified action=manual_stop_required"
                     );
+                    motor.standby();
                     while !stop_requested() {
-                        motor.standby();
                         sleep_us(100_000);
                     }
                     return;
@@ -554,8 +554,8 @@ fn handle_red_container(
                     eprintln!(
                         "AKARS_MISSION_HALT reason=gripper_close_unverified action=manual_stop_required"
                     );
+                    motor.standby();
                     while !stop_requested() {
-                        motor.standby();
                         sleep_us(100_000);
                     }
                     return;
