@@ -106,6 +106,33 @@ verified deposits and directly prints a Chinese single-frame summary covering
 camera wait, JPU, VPSS, TDMA, TPU inference, postprocess, other visual overhead,
 total visual latency, and mean detection confidence.
 
+For a possible kernel hang or crash, start the persistent kernel log collector
+before starting the robot program:
+
+```bash
+nohup ./capture-kernel-log.sh /root/kernel-live-v2.log 0.2 2.0 \
+  >/root/kernel-live-v2-monitor.out 2>&1 &
+echo $!
+
+while ! grep -q 'AKARS_KERNEL_LOG_RUNNING' /root/kernel-live-v2-monitor.out; do
+  sleep 0.2
+done
+```
+
+The second argument is the kernel-ring polling interval and the third is the
+log-file `fsync` interval, both in seconds. The defaults are 0.2 and 2.0. The
+wrapper execs the statically linked `kernel-log-capture` helper, which calls
+StarryOS `syslog(READ_CLEAR)` directly from one long-lived process. It does not
+spawn `dmesg`, `sleep`, or `dd` for every poll. This is deliberate: an older
+full-snapshot shell implementation wrote 11.7 MB in under two minutes, and an
+older concurrent global-`sync` implementation could block StarryOS filesystem
+users including sshd and `akars`. While collection is active, a separate manual
+`dmesg` sees only messages accumulated since the most recent poll; the durable
+history is `/root/kernel-live-v2.log`. Do not write the log under `/tmp`, which
+is not persistent. Wait for the `RUNNING` line as shown above before starting
+the robot. Frequent fsync remains intended for crash diagnosis and may add
+storage latency, so stop the collector before formal performance benchmarking.
+
 `AKARS_MODEL` may be set explicitly for controlled A/B tests. Do not use the
 384×384 model or the current `p2_aligned` model for normal autonomous
 operation: in the same distant-ball scene the former produced 0/150

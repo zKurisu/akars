@@ -67,5 +67,9 @@ path = "src/bin/red_cloth_follow.rs"
 name = "cam_web"
 path = "src/bin/cam_web.rs"
 
+[[bin]]
+name = "kernel-log-capture"
+path = "src/bin/kernel_log_capture.rs"
+
 [profile.release]
 lto = "thin"
