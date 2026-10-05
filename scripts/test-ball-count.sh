@@ -12,4 +12,17 @@ case "$ball_count" in
 esac
 shift
 
-exec "$case_dir/run-robot.sh" --max-deposits "$ball_count" "$@"
+model="${AKARS_MODEL:-$case_dir/model/yolov8n_tennis_v2.cvimodel}"
+export LD_LIBRARY_PATH="$case_dir/lib:${LD_LIBRARY_PATH:-}"
+
+exec "$case_dir/akars" "$model" \
+  --camera /dev/cvi-usb-camera0 \
+  --vpss /dev/cvi-vpss0 \
+  --motor /dev/ttyS1 \
+  --arm /dev/ttyS2 \
+  --classes 1 \
+  --conf 0.5 \
+  --iou 0.5 \
+  --tpu-debug "${AKARS_TPU_DEBUG:-off}" \
+  --max-deposits "$ball_count" \
+  "$@"

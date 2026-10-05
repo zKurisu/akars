@@ -99,8 +99,9 @@ To test an exact number of complete pickup/return cycles, use:
 ./test-ball-count.sh 3
 ```
 
-Install `scripts/test-ball-count.sh` next to `run-robot.sh` on the robot. The
-first argument must be a positive integer. The robot stops after that many
+Install `scripts/test-ball-count.sh` next to `akars`, `model/`, and `lib/` on
+the robot. The script starts `akars` directly and does not depend on the normal
+launcher. The first argument must be a positive integer. The robot stops after that many
 verified deposits and directly prints a Chinese single-frame summary covering
 camera wait, JPU, VPSS, TDMA, TPU inference, postprocess, other visual overhead,
 total visual latency, and mean detection confidence.
