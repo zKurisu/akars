@@ -52,6 +52,7 @@ struct RobotState {
     holding_ball: bool,
     red_confirm_count: u32,
     slow_search_after_deposit: bool,
+    post_deposit_search_frames_remaining: u32,
 }
 
 impl Default for RobotState {
@@ -64,6 +65,7 @@ impl Default for RobotState {
             holding_ball: false,
             red_confirm_count: 0,
             slow_search_after_deposit: false,
+            post_deposit_search_frames_remaining: 0,
         }
     }
 }
@@ -77,6 +79,7 @@ impl RobotState {
         self.grab_confirm_count = 0;
         self.red_confirm_count = 0;
         self.slow_search_after_deposit = false;
+        self.post_deposit_search_frames_remaining = 0;
     }
 
     fn mark_deposit_complete(&mut self) {
@@ -87,6 +90,7 @@ impl RobotState {
         self.grab_confirm_count = 0;
         self.red_confirm_count = 0;
         self.slow_search_after_deposit = true;
+        self.post_deposit_search_frames_remaining = POST_DEPOSIT_BLIND_SEARCH_FRAMES;
     }
 
     fn may_approach_red(&self) -> bool {
@@ -107,6 +111,14 @@ impl RobotState {
         } else {
             TURN_SPEED
         }
+    }
+
+    fn consume_post_deposit_search_guard(&mut self) -> Option<u32> {
+        if self.post_deposit_search_frames_remaining == 0 {
+            return None;
+        }
+        self.post_deposit_search_frames_remaining -= 1;
+        Some(self.post_deposit_search_frames_remaining)
     }
 }
 
@@ -141,10 +153,20 @@ const IDLE_SPEED: i32 = 12;
 // the next tennis ball instead of sweeping past it between captured frames.
 // Keep IDLE_SPEED unchanged for the existing chase/search behaviours.
 const POST_DEPOSIT_SEARCH_SPEED: i32 = 6;
+const POST_DEPOSIT_BACKOFF_SPEED: i32 = 16;
+const POST_DEPOSIT_BACKOFF_US: u64 = 250_000;
+const POST_DEPOSIT_SETTLE_US: u64 = 20_000;
+/// Ignore the just-deposited ball long enough to turn the camera away from the
+/// container. At roughly 10 FPS this is about two seconds of in-place search.
+const POST_DEPOSIT_BLIND_SEARCH_FRAMES: u32 = 20;
 const GRAB_CONFIRM_THRESHOLD: i32 = 2;
 const BACKWARD_SPEED: i32 = 16;
 const BACKWARD_PULSE_US: u64 = 80_000;
+const RED_APPROACH_FAST_SPEED: i32 = 12;
+const RED_APPROACH_MEDIUM_SPEED: i32 = 9;
 const RED_CRAWL_SPEED: i32 = 6;
+const RED_APPROACH_MEDIUM_BBOX_AREA: f32 = 0.45;
+const RED_APPROACH_NEAR_BBOX_AREA: f32 = 0.75;
 // A wide red container often already covers the optical centre even when its
 // noisy bounding-box centre is offset. Give it a wider, bbox-aware dead band
 // and use short corrections so consecutive frames do not command opposite
@@ -618,18 +640,37 @@ fn handle_detections(
     motor: &mut Motor,
     arm: &mut Arm,
 ) {
+    // The released tennis ball initially fills the camera view. Treating it
+    // as a new target immediately cancels the intended in-place turn and can
+    // enter the normal too-close reverse path. Hold a short, deterministic
+    // in-place search window after every deposit before accepting a new ball.
+    if let Some(remaining_frames) = robot.consume_post_deposit_search_guard() {
+        robot.status = RobotStatus::ChaseTennis;
+        robot.area_ratio = 0.0;
+        robot.ball_cx = 0;
+        robot.grab_confirm_count = 0;
+        eprintln!(
+            "[detect] post-deposit in-place guard remaining_frames={} ignored_detections={}",
+            remaining_frames,
+            detections.len()
+        );
+        search_for_target_after_deposit(motor);
+        return;
+    }
+
     if detections.is_empty() {
         eprintln!("[detect] no ball detected, searching");
-        // Ball was recently close (area > 30%) and now disappeared —
-        // likely blocking the camera.  Back up further to get a clear view.
+        // A close ball can briefly disappear below the camera. Do not reverse:
+        // an immediate reverse-to-turn transition makes the chassis trace an
+        // arc. Brake out the previous forward command, then rotate in place.
         let was_close = robot.area_ratio >= 0.30 || robot.grab_confirm_count > 0;
         if was_close {
             eprintln!(
-                "[detect] ball disappeared at area={:.3}, backing up to re-detect",
+                "[detect] ball disappeared at area={:.3}, braking before in-place search",
                 robot.area_ratio
             );
-            motor.backward(BACKWARD_SPEED);
-            sleep_us(BACKWARD_PULSE_US * 8);
+            motor.brake();
+            sleep_us(20_000);
             motor.standby();
         }
         robot.grab_confirm_count = 0;
@@ -850,17 +891,29 @@ fn handle_red_container(
                 "AKARS_GRIPPER_RELEASE_COMPLETE servo=2 target_angle=200 actual_angle={actual_angle:.1} verified=1 chassis_stopped=1"
             );
             // The ball is already released and verified. Send the relaxed
-            // 98-degree restore command, then start searching immediately;
-            // do not block chassis motion on a second position read. The
-            // gripper and chassis have independent UART controllers, so the
-            // restore and slow turn can safely run concurrently.
+            // 98-degree restore command without blocking on a second position
+            // read; the chassis then backs away and starts the slow turn.
             arm.set_angle(2, S2_DEPOSIT_RESTORE, 1000);
             eprintln!(
-                "AKARS_GRIPPER_RESTORE_COMMAND servo=2 target_angle={S2_DEPOSIT_RESTORE} immediate_turn=1"
+                "AKARS_GRIPPER_RESTORE_COMMAND servo=2 target_angle={S2_DEPOSIT_RESTORE} next_action=backoff_then_turn"
             );
 
             robot.mark_deposit_complete();
             eprintln!("AKARS_MISSION_TRANSITION from=ReleaseTennis to=ChaseTennis holding_ball=0");
+
+            // Back straight away from the container first, stop both wheels,
+            // and only then begin the clockwise search. Keeping these as
+            // separate motor phases prevents a reverse arc.
+            let (backoff_left, backoff_right) = post_deposit_backoff_speeds();
+            eprintln!(
+                "AKARS_MISSION_ACTION action=back_away_after_deposit left={} right={} duration_us={POST_DEPOSIT_BACKOFF_US}",
+                backoff_left, backoff_right
+            );
+            motor.drive(backoff_left, backoff_right);
+            sleep_us(POST_DEPOSIT_BACKOFF_US);
+            motor.brake();
+            sleep_us(POST_DEPOSIT_SETTLE_US);
+            motor.standby();
 
             // Servos 0/1 stay in the raised carrying pose. Servo 2 has already
             // returned directly from deposit-open 200 degrees to the relaxed
@@ -930,7 +983,7 @@ fn red_chase_motion(red: RedObservation) -> ChaseMotion {
     let offset = target_cx - center;
 
     if offset.abs() <= center_margin {
-        ChaseMotion::Forward(RED_CRAWL_SPEED)
+        ChaseMotion::Forward(red_forward_speed(red))
     } else {
         let excess = offset.abs().saturating_sub(center_margin) as u64;
         let pulse_us = (RED_TURN_PULSE_MIN_US + excess.saturating_mul(300))
@@ -940,6 +993,19 @@ fn red_chase_motion(red: RedObservation) -> ChaseMotion {
         } else {
             ChaseMotion::TurnRight(pulse_us)
         }
+    }
+}
+
+/// Use a faster approach while the red container is distant, then retain the
+/// verified crawl speed for the final 100% x 98% deposit geometry.
+fn red_forward_speed(red: RedObservation) -> i32 {
+    let bbox_area = red.bbox_area_ratio();
+    if bbox_area < RED_APPROACH_MEDIUM_BBOX_AREA {
+        RED_APPROACH_FAST_SPEED
+    } else if bbox_area < RED_APPROACH_NEAR_BBOX_AREA {
+        RED_APPROACH_MEDIUM_SPEED
+    } else {
+        RED_CRAWL_SPEED
     }
 }
 
@@ -984,12 +1050,23 @@ fn align_target(offset: i32, pulse_us: u64, turn_speed: i32, motor: &mut Motor) 
 
 /// Use the exact same continuous search motion as the tennis chase loop.
 pub fn search_for_target(motor: &mut Motor) {
-    motor.drive(IDLE_SPEED, -IDLE_SPEED);
+    let (left, right) = in_place_search_speeds(IDLE_SPEED);
+    motor.drive(left, right);
 }
 
 /// Slow clockwise search used only immediately after depositing a ball.
 fn search_for_target_after_deposit(motor: &mut Motor) {
-    motor.drive(POST_DEPOSIT_SEARCH_SPEED, -POST_DEPOSIT_SEARCH_SPEED);
+    let (left, right) = in_place_search_speeds(POST_DEPOSIT_SEARCH_SPEED);
+    motor.drive(left, right);
+}
+
+/// Equal and opposite wheel commands guarantee zero commanded translation.
+fn in_place_search_speeds(speed: i32) -> (i32, i32) {
+    (speed, -speed)
+}
+
+fn post_deposit_backoff_speeds() -> (i32, i32) {
+    (-POST_DEPOSIT_BACKOFF_SPEED, -POST_DEPOSIT_BACKOFF_SPEED)
 }
 
 fn scaled_center_margin(image_w: i32, base: i32) -> i32 {
@@ -1012,9 +1089,11 @@ fn sleep_us(us: u64) {
 mod tests {
     use super::{
         ball_turn_pulse_us, chase_motion, close_ball_alignment_motion, decide_red_action,
-        grab_centered, scaled_center_margin, ChaseMotion, RedMissionAction, RobotState,
+        grab_centered, in_place_search_speeds, post_deposit_backoff_speeds,
+        red_forward_speed, scaled_center_margin, ChaseMotion, RedMissionAction, RobotState,
         RobotStatus, BALL_TURN_PULSE_MAX_US, BALL_TURN_PULSE_MIN_US,
-        CLOSE_BALL_TURN_PULSE_MIN_US, DEFAULT_RED_STOP_CONFIRM_FRAMES,
+        CLOSE_BALL_TURN_PULSE_MIN_US,
+        DEFAULT_RED_STOP_CONFIRM_FRAMES,
     };
     use crate::red_target::RedObservation;
 
@@ -1087,6 +1166,29 @@ mod tests {
     }
 
     #[test]
+    fn search_wheel_speeds_are_always_in_place() {
+        assert_eq!(in_place_search_speeds(super::IDLE_SPEED), (12, -12));
+        assert_eq!(in_place_search_speeds(super::POST_DEPOSIT_SEARCH_SPEED), (6, -6));
+    }
+
+    #[test]
+    fn post_deposit_backoff_and_search_are_separate_motion_phases() {
+        assert_eq!(post_deposit_backoff_speeds(), (-16, -16));
+        assert_eq!(in_place_search_speeds(super::POST_DEPOSIT_SEARCH_SPEED), (6, -6));
+    }
+
+    #[test]
+    fn red_approach_uses_distance_dependent_speed() {
+        let far = red_observation(240, 160, 399, 319);
+        let medium = red_observation(96, 72, 543, 407);
+        let near = red_observation(16, 12, 623, 467);
+
+        assert_eq!(red_forward_speed(far), 12);
+        assert_eq!(red_forward_speed(medium), 9);
+        assert_eq!(red_forward_speed(near), 6);
+    }
+
+    #[test]
     fn red_is_ignored_when_gripper_is_empty() {
         let mut robot = RobotState::default();
         let full_frame = red_observation(0, 0, 639, 479);
@@ -1130,7 +1232,7 @@ mod tests {
         let wide_right = red_observation(160, 140, 639, 339);
         assert_eq!(
             decide_red_action(&mut robot, Some(wide_right)),
-            RedMissionAction::Chase(ChaseMotion::Forward(super::RED_CRAWL_SPEED))
+            RedMissionAction::Chase(ChaseMotion::Forward(12))
         );
     }
 
@@ -1180,6 +1282,17 @@ mod tests {
         assert!(!robot.holding_ball);
         assert_eq!(robot.red_confirm_count, 0);
         assert!(robot.slow_search_after_deposit);
+        assert_eq!(
+            robot.post_deposit_search_frames_remaining,
+            super::POST_DEPOSIT_BLIND_SEARCH_FRAMES
+        );
+        for expected_remaining in (0..super::POST_DEPOSIT_BLIND_SEARCH_FRAMES).rev() {
+            assert_eq!(
+                robot.consume_post_deposit_search_guard(),
+                Some(expected_remaining)
+            );
+        }
+        assert_eq!(robot.consume_post_deposit_search_guard(), None);
         assert_eq!(robot.search_speed(), super::POST_DEPOSIT_SEARCH_SPEED);
         assert_eq!(robot.turn_speed(), super::POST_DEPOSIT_SEARCH_SPEED);
         assert_eq!(
