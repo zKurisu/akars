@@ -93,6 +93,18 @@ still accumulates every stage and prints `AKARS_STAGE_AVERAGE report=final`
 with the per-frame averages when the process exits normally or handles
 Ctrl+C.
 
+To test an exact number of complete pickup/return cycles, use:
+
+```bash
+./test-ball-count.sh 3
+```
+
+Install `scripts/test-ball-count.sh` next to `run-robot.sh` on the robot. The
+first argument must be a positive integer. The robot stops after that many
+verified deposits and directly prints a Chinese single-frame summary covering
+camera wait, JPU, VPSS, TDMA, TPU inference, postprocess, other visual overhead,
+total visual latency, and mean detection confidence.
+
 `AKARS_MODEL` may be set explicitly for controlled A/B tests. Do not use the
 384×384 model or the current `p2_aligned` model for normal autonomous
 operation: in the same distant-ball scene the former produced 0/150

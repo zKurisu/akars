@@ -154,7 +154,7 @@ const IDLE_SPEED: i32 = 12;
 // Keep IDLE_SPEED unchanged for the existing chase/search behaviours.
 const POST_DEPOSIT_SEARCH_SPEED: i32 = 6;
 const POST_DEPOSIT_BACKOFF_SPEED: i32 = 16;
-const POST_DEPOSIT_BACKOFF_US: u64 = 250_000;
+const POST_DEPOSIT_BACKOFF_US: u64 = 500_000;
 const POST_DEPOSIT_SETTLE_US: u64 = 20_000;
 /// Ignore the just-deposited ball long enough to turn the camera away from the
 /// container. At roughly 10 FPS this is about two seconds of in-place search.
@@ -206,6 +206,27 @@ struct StageTimingSample {
 struct StageTimingTotals {
     frames: u64,
     sum: StageTimingSample,
+}
+
+#[derive(Debug, Default)]
+struct ConfidenceTotals {
+    detected_frames: u64,
+    score_sum: f64,
+}
+
+impl ConfidenceTotals {
+    fn record(&mut self, score: f32) {
+        self.detected_frames = self.detected_frames.saturating_add(1);
+        self.score_sum += score as f64;
+    }
+
+    fn mean_percent(&self) -> f64 {
+        if self.detected_frames == 0 {
+            0.0
+        } else {
+            self.score_sum * 100.0 / self.detected_frames as f64
+        }
+    }
 }
 
 impl StageTimingTotals {
@@ -284,6 +305,52 @@ impl StageTimingTotals {
                 .saturating_add(self.sum.postprocess_us)),
         );
     }
+
+    fn human_summary(&self, confidence: &ConfidenceTotals) -> Option<String> {
+        if self.frames == 0 {
+            return None;
+        }
+        let mean_ms = |total: u64| total as f64 / self.frames as f64 / 1_000.0;
+        let vpss_total_us = self
+            .sum
+            .vpss_queue_us
+            .saturating_add(self.sum.vpss_hardware_us)
+            .saturating_add(self.sum.vpss_wake_return_us);
+        let camera_jpu_vpss_us = self
+            .sum
+            .camera_wait_us
+            .saturating_add(self.sum.jpu_decode_us)
+            .saturating_add(vpss_total_us);
+        let vision_total_with_other_us = self
+            .sum
+            .vision_total_us
+            .saturating_add(self.sum.other_us);
+
+        Some(format!(
+            "单帧平均性能汇总\n\
+摄像头等待                   {:>7.3} ms\n\
+JPU解码                      {:>7.3} ms\n\
+VPSS                         {:>7.3} ms\n\
+摄像头/JPU等待 + VPSS        {:>7.3} ms\n\
+TPU输入TDMA搬运              {:>7.3} ms\n\
+TPU推理                      {:>7.3} ms\n\
+后处理                       {:>7.3} ms\n\
+其他视觉开销                 {:>7.3} ms\n\
+-------------------------------------\n\
+视觉总时延                   {:>7.3} ms\n\
+单帧平均置信度               {:>7.2} %",
+            mean_ms(self.sum.camera_wait_us),
+            mean_ms(self.sum.jpu_decode_us),
+            mean_ms(vpss_total_us),
+            mean_ms(camera_jpu_vpss_us),
+            mean_ms(self.sum.tdma_us),
+            mean_ms(self.sum.tpu_forward_us),
+            mean_ms(self.sum.postprocess_us),
+            mean_ms(self.sum.other_us),
+            mean_ms(vision_total_with_other_us),
+            confidence.mean_percent(),
+        ))
+    }
 }
 
 /// Motor decision shared by the tennis hunter and any target follower that
@@ -337,6 +404,7 @@ pub fn run_tennis_hunter(
     let mut frame_count = 0u64;
     let mut tennis_timing = StageTimingTotals::default();
     let mut red_timing = StageTimingTotals::default();
+    let mut tennis_confidence = ConfidenceTotals::default();
     let mut completed_deposits = 0u32;
     let mut camera_errors = 0u32;
     // Recovery tier: 0=not tried yet, 1=re_init tried, 2=reopen tried,
@@ -479,14 +547,16 @@ pub fn run_tennis_hunter(
                     continue;
                 }
             };
-            handle_detections(
+            if let Some(score) = handle_detections(
                 &detections,
                 CAMERA_WIDTH as i32,
                 CAMERA_HEIGHT as i32,
                 &mut robot,
                 &mut motor,
                 &mut arm,
-            );
+            ) {
+                tennis_confidence.record(score);
+            }
         }
         let handle_us = handle_start.elapsed().as_micros() as i64;
 
@@ -624,6 +694,19 @@ pub fn run_tennis_hunter(
 
     tennis_timing.print_average("tennis", "final");
     red_timing.print_average("red", "final");
+    eprintln!(
+        "AKARS_PERFORMANCE_SUMMARY completed_deposits={} target_deposits={} tennis_frames={} detected_frames={} mean_confidence_percent={:.2}",
+        completed_deposits,
+        config
+            .max_deposits
+            .map_or_else(|| "unlimited".to_string(), |value| value.to_string()),
+        tennis_timing.frames,
+        tennis_confidence.detected_frames,
+        tennis_confidence.mean_percent(),
+    );
+    if let Some(summary) = tennis_timing.human_summary(&tennis_confidence) {
+        eprintln!("\n{summary}");
+    }
     motor.standby();
     eprintln!(
         "AKARS_MISSION_SUMMARY completed_deposits={} holding_ball={}",
@@ -639,7 +722,7 @@ fn handle_detections(
     robot: &mut RobotState,
     motor: &mut Motor,
     arm: &mut Arm,
-) {
+) -> Option<f32> {
     // The released tennis ball initially fills the camera view. Treating it
     // as a new target immediately cancels the intended in-place turn and can
     // enter the normal too-close reverse path. Hold a short, deterministic
@@ -655,7 +738,7 @@ fn handle_detections(
             detections.len()
         );
         search_for_target_after_deposit(motor);
-        return;
+        return None;
     }
 
     if detections.is_empty() {
@@ -682,7 +765,7 @@ fn handle_detections(
         } else {
             search_for_target(motor);
         }
-        return;
+        return None;
     }
 
     // The 6/-6 setting is deliberately limited to blind post-deposit search.
@@ -770,6 +853,7 @@ fn handle_detections(
         robot.status = RobotStatus::ChaseTennis;
         execute_chase_motion_at_turn_speed(chase_motion, robot.turn_speed(), motor);
     }
+    Some(best.score)
 }
 
 fn decide_red_action(
@@ -1089,10 +1173,10 @@ fn sleep_us(us: u64) {
 mod tests {
     use super::{
         ball_turn_pulse_us, chase_motion, close_ball_alignment_motion, decide_red_action,
-        grab_centered, in_place_search_speeds, post_deposit_backoff_speeds,
-        red_forward_speed, scaled_center_margin, ChaseMotion, RedMissionAction, RobotState,
-        RobotStatus, BALL_TURN_PULSE_MAX_US, BALL_TURN_PULSE_MIN_US,
-        CLOSE_BALL_TURN_PULSE_MIN_US,
+        grab_centered, in_place_search_speeds, post_deposit_backoff_speeds, red_forward_speed,
+        scaled_center_margin, ChaseMotion, ConfidenceTotals, RedMissionAction, RobotState,
+        RobotStatus, StageTimingSample, StageTimingTotals, BALL_TURN_PULSE_MAX_US,
+        BALL_TURN_PULSE_MIN_US, CLOSE_BALL_TURN_PULSE_MIN_US,
         DEFAULT_RED_STOP_CONFIRM_FRAMES,
     };
     use crate::red_target::RedObservation;
@@ -1174,7 +1258,33 @@ mod tests {
     #[test]
     fn post_deposit_backoff_and_search_are_separate_motion_phases() {
         assert_eq!(post_deposit_backoff_speeds(), (-16, -16));
+        assert_eq!(super::POST_DEPOSIT_BACKOFF_US, 500_000);
         assert_eq!(in_place_search_speeds(super::POST_DEPOSIT_SEARCH_SPEED), (6, -6));
+    }
+
+    #[test]
+    fn human_performance_summary_uses_actual_stage_averages() {
+        let mut timing = StageTimingTotals::default();
+        timing.record(StageTimingSample {
+            camera_wait_us: 2_745,
+            jpu_decode_us: 1_708,
+            vpss_queue_us: 27,
+            vpss_hardware_us: 1_475,
+            vpss_wake_return_us: 132,
+            tdma_us: 1_116,
+            tpu_forward_us: 41_418,
+            postprocess_us: 1_629,
+            vision_total_us: 50_252,
+            other_us: 189,
+            ..StageTimingSample::default()
+        });
+        let mut confidence = ConfidenceTotals::default();
+        confidence.record(0.9083);
+
+        let summary = timing.human_summary(&confidence).unwrap();
+        assert!(summary.contains("摄像头/JPU等待 + VPSS          6.087 ms"));
+        assert!(summary.contains("视觉总时延                    50.441 ms"));
+        assert!(summary.contains("单帧平均置信度                 90.83 %"));
     }
 
     #[test]
