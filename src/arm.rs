@@ -23,6 +23,11 @@ const S2_READY: f32 = 100.0;
 const S0_REACH: f32 = 198.0; // servo0 swings down
 const S1_PUSH: f32 = 115.0; // servo1 pushes arm toward ball
 
+// Slow only the initial reach/pull-in movement. A larger controller time
+// means a lower servo speed for the same calibrated angle travel.
+const GRAB_REACH_TIME_MS: i32 = 1500;
+const GRAB_REACH_SETTLE_MS: u64 = 1800;
+
 // ── Step 3: Open gripper wide + continue pushing ──
 const S2_OPEN: f32 = 180.0; // gripper fully open (was 150, wider for visibility)
 const S1_CONTINUE: f32 = 95.0; // servo1 keeps going down
@@ -88,11 +93,13 @@ impl Arm {
         eprintln!("[arm] === grab sequence start ===");
 
         // Step 2: servo0 swings down, servo1 pushes toward ball.
-        eprintln!("[arm] step 2: reach down (s0={S0_REACH} s1={S1_PUSH})");
-        self.set_angle(0, S0_REACH, 1000);
+        eprintln!(
+            "[arm] step 2: reach down (s0={S0_REACH} s1={S1_PUSH} time_ms={GRAB_REACH_TIME_MS})"
+        );
+        self.set_angle(0, S0_REACH, GRAB_REACH_TIME_MS);
         sleep_ms(300);
-        self.set_angle(1, S1_PUSH, 1000);
-        sleep_ms(1500); // let both moves finish
+        self.set_angle(1, S1_PUSH, GRAB_REACH_TIME_MS);
+        sleep_ms(GRAB_REACH_SETTLE_MS); // let both slower moves finish
 
         // Step 3: open gripper wide WHILE servo1 keeps going down.
         eprintln!("[arm] step 3: open gripper + push (s2={S2_OPEN} s1={S1_CONTINUE})");
