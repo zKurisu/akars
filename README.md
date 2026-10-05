@@ -68,14 +68,42 @@ scripts/upload.sh /dev/sda2
 Run on device:
 
 ```bash
-./akars /akars_tennis/model/yolov8n_tennis_p2_384_aligned_int8.cvimodel \
+./akars /akars_tennis/model/yolov8n_tennis_v2.cvimodel \
   --camera /dev/cvi-usb-camera0 \
   --vpss /dev/cvi-vpss0 \
   --motor /dev/ttyS1 \
   --arm /dev/ttyS2
 ```
 
-The autonomous hunt path requires an aligned, fused-preprocess UINT8 RGB-planar model. Camera MJPEG is decoded by JPU into an ION YUV422P buffer, VPSS performs letterbox and colour conversion into an RGB-planar ION buffer, and the TPU runtime binds that physical buffer directly. The older non-aligned yolov8n_tennis_v2.cvimodel remains usable by detect, but hunt deliberately rejects it so the controller cannot silently fall back to CPU preprocessing.
+On the robot, the checked-in launcher selects the validated 640×640 model by
+default:
+
+```bash
+./run-robot.sh
+```
+
+The launcher explicitly keeps expensive per-frame TPU diagnostics disabled:
+
+```bash
+AKARS_TPU_DEBUG=off ./run-robot.sh
+```
+
+Set `AKARS_TPU_DEBUG=on` only for short troubleshooting runs. Debug-off mode
+still accumulates every stage and prints `AKARS_STAGE_AVERAGE report=final`
+with the per-frame averages when the process exits normally or handles
+Ctrl+C.
+
+`AKARS_MODEL` may be set explicitly for controlled A/B tests. Do not use the
+384×384 model or the current `p2_aligned` model for normal autonomous
+operation: in the same distant-ball scene the former produced 0/150
+detections and the latter 0/38, while `yolov8n_tennis_v2.cvimodel` produced
+101/101 with 94.08% mean confidence.
+
+The autonomous hunt path requires a fused-preprocess UINT8 RGB-planar model.
+Camera MJPEG is decoded by JPU into an ION YUV422P buffer and VPSS performs
+letterbox and colour conversion into an RGB-planar ION buffer. Aligned models
+bind that buffer directly; the validated ordinary 640 model imports it through
+the runtime TDMA path without falling back to CPU image preprocessing.
 
 The autonomous mission is cyclic: chase and grab a tennis ball, search for the
 red container only after the grab completes, approach until its bounding box

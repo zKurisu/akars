@@ -17,9 +17,11 @@ struct Cli {
     motor: String,
     arm: String,
     frames: Option<u64>,
+    max_deposits: Option<u32>,
     classes: i32,
     conf: f32,
     iou: f32,
+    tpu_debug: bool,
 }
 
 /// Arguments for the standalone TPU inference test: run a model on a single
@@ -61,9 +63,11 @@ impl Default for Cli {
             motor: "/dev/ttyS1".to_string(),
             arm: "/dev/ttyS2".to_string(),
             frames: None,
+            max_deposits: None,
             classes: 1,
             conf: 0.5,
             iou: 0.5,
+            tpu_debug: false,
         }
     }
 }
@@ -131,8 +135,7 @@ fn run_hunt(cli: Cli) {
     };
     let contract = model.input_contract();
     eprintln!("{}", contract.summary());
-    let contract_ok = contract.aligned
-        && contract.format == 7
+    let contract_ok = contract.format == 7
         && contract.pixel_format == PhysicalPixelFormat::RgbPlanar as i32
         && (contract.qscale - 1.0).abs() <= 1.0e-6
         && contract.zero_point == 0
@@ -143,7 +146,7 @@ fn run_hunt(cli: Cli) {
             .all(|value| (*value - 1.0).abs() <= 1.0e-6);
     if !contract_ok {
         eprintln!(
-            "[tpu] model is incompatible with VPSS zero-copy input; expected aligned UINT8 RGB_PLANAR, qscale=1, zero_point=0, mean=0, scale=1"
+            "[tpu] model is incompatible with VPSS input; expected UINT8 RGB_PLANAR, qscale=1, zero_point=0, mean=0, scale=1"
         );
         std::process::exit(1);
     }
@@ -202,8 +205,10 @@ fn run_hunt(cli: Cli) {
             classes_num: cli.classes,
             confidence_threshold: cli.conf,
             iou_threshold: cli.iou,
+            debug_logging: cli.tpu_debug,
         },
         max_frames: cli.frames,
+        max_deposits: cli.max_deposits,
     };
 
     run_tennis_hunter(pipeline, model, motor, arm, config);
@@ -236,6 +241,7 @@ fn run_detect(cli: DetectCli) {
         classes_num: cli.classes,
         confidence_threshold: cli.conf,
         iou_threshold: cli.iou,
+        debug_logging: false,
     };
 
     eprintln!("[detect] starting detect_image ...");
@@ -357,6 +363,15 @@ fn parse_hunt_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                         .map_err(|_| "--frames expects an integer".to_string())?,
                 );
             }
+            "--max-deposits" => {
+                let value = take_value(&mut args, "--max-deposits")?
+                    .parse::<u32>()
+                    .map_err(|_| "--max-deposits expects a positive integer".to_string())?;
+                if value == 0 {
+                    return Err("--max-deposits expects a positive integer".to_string());
+                }
+                cli.max_deposits = Some(value);
+            }
             "--classes" => {
                 cli.classes = take_value(&mut args, "--classes")?
                     .parse()
@@ -371,6 +386,9 @@ fn parse_hunt_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                 cli.iou = take_value(&mut args, "--iou")?
                     .parse()
                     .map_err(|_| "--iou expects a float".to_string())?;
+            }
+            "--tpu-debug" => {
+                cli.tpu_debug = parse_on_off(&take_value(&mut args, "--tpu-debug")?)?;
             }
             value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
             value => {
@@ -507,9 +525,17 @@ fn take_value(
         .ok_or_else(|| format!("{option} expects a value"))
 }
 
+fn parse_on_off(value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err("--tpu-debug expects 'on' or 'off'".to_string()),
+    }
+}
+
 fn print_usage() {
     eprintln!(
-        "Usage:\n  akars <aligned-model.cvimodel> [--camera DEV] [--vpss DEV] [--motor DEV] [--arm DEV] [--frames N] [--classes N] [--conf X] [--iou X]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n\nNote: motor defaults to /dev/ttyS1 (JTAG pads). Use --motor /dev/ttyS3 for\nGPIOP UART3, but this will disconnect WiFi (shared SDIO pins)."
+        "Usage:\n  akars <aligned-model.cvimodel> [--camera DEV] [--vpss DEV] [--motor DEV] [--arm DEV] [--frames N] [--max-deposits N] [--classes N] [--conf X] [--iou X] [--tpu-debug on|off]\n  akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--mock]\n  akars detect <model.cvimodel> <image> [--out PATH] [--classes N] [--conf X] [--iou X]\n  akars capture [output.jpg] [--camera DEV] [--out PATH] [--warmup N]\n\nTPU debug defaults to off. With debug off, per-frame TPU details are suppressed,\nbut final per-stage single-frame averages are still printed. --max-deposits stops\nthe chassis safely after N verified deposit cycles.\n\nNote: motor defaults to /dev/ttyS1 (JTAG pads). Use --motor /dev/ttyS3 for\nGPIOP UART3, but this will disconnect WiFi (shared SDIO pins)."
     );
 }
 
@@ -529,4 +555,16 @@ fn print_web_usage() {
     eprintln!(
         "Usage: akars serve [--listen HOST:PORT] [--motor DEV] [--arm DEV] [--camera DEV] [--mock]\n\nDefaults:\n  --listen 0.0.0.0:8080\n  --motor /dev/ttyS1\n  --arm /dev/ttyS2\n  --camera (none — camera streaming disabled)"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_on_off;
+
+    #[test]
+    fn parses_tpu_debug_switch() {
+        assert_eq!(parse_on_off("on"), Ok(true));
+        assert_eq!(parse_on_off("off"), Ok(false));
+        assert!(parse_on_off("1").is_err());
+    }
 }

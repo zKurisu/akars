@@ -9,6 +9,9 @@ pub struct InferenceConfig {
     pub classes_num: i32,
     pub confidence_threshold: f32,
     pub iou_threshold: f32,
+    /// Emit expensive per-frame TPU/tensor diagnostics. Keep disabled during
+    /// normal operation so stderr I/O does not pollute postprocess timing.
+    pub debug_logging: bool,
 }
 
 impl Default for InferenceConfig {
@@ -17,6 +20,7 @@ impl Default for InferenceConfig {
             classes_num: 1,
             confidence_threshold: 0.5,
             iou_threshold: 0.5,
+            debug_logging: false,
         }
     }
 }
@@ -365,6 +369,80 @@ mod imp {
             Ok(detections)
         }
 
+        /// Import a VPSS-produced RGB-planar frame into an ordinary
+        /// (`aligned=false`) model through the CVI runtime's TDMA path.
+        ///
+        /// # Safety
+        ///
+        /// `paddr` must identify a live DMA-visible buffer matching the model
+        /// input dimensions and remain valid until this blocking call returns.
+        pub unsafe fn infer_vpss_rgb_timed(
+            &mut self,
+            paddr: u64,
+            source_width: i32,
+            source_height: i32,
+            config: InferenceConfig,
+            mut timing: Option<&mut InferTiming>,
+        ) -> Result<Vec<Detection>, TpuError> {
+            if paddr == 0 {
+                return Err(TpuError::new("VPSS physical address is zero"));
+            }
+            if source_width <= 0 || source_height <= 0 {
+                return Err(TpuError::new("source dimensions must be positive"));
+            }
+            let input = unsafe { &*self.input };
+            if input.aligned {
+                return Err(TpuError::new(
+                    "ordinary VPSS import requires an aligned=false model",
+                ));
+            }
+            if input.pixel_format != super::PhysicalPixelFormat::RgbPlanar as i32
+                || input.fmt != CVI_FMT_UINT8
+            {
+                return Err(TpuError::new(format!(
+                    "VPSS TDMA input requires UINT8 RGB_PLANAR, got format={} pixel_format={}",
+                    input.fmt, input.pixel_format
+                )));
+            }
+            let bytes = rgb_tensor_len(self.input_w, self.input_h)?;
+            let last = paddr
+                .checked_add((bytes - 1) as u64)
+                .ok_or_else(|| TpuError::new("VPSS physical range overflow"))?;
+            if last > u64::from(u32::MAX) {
+                return Err(TpuError::new("VPSS physical range exceeds SG2002 DMA32"));
+            }
+
+            let mut frame_paddrs = [paddr];
+            let preprocess_start = Instant::now();
+            let rc = unsafe {
+                CVI_NN_SetTensorWithAlignedFrames(
+                    self.input,
+                    frame_paddrs.as_mut_ptr(),
+                    1,
+                    super::PhysicalPixelFormat::RgbPlanar as i32,
+                )
+            };
+            let preprocess_us = preprocess_start.elapsed().as_micros() as i64;
+            if rc != CVI_RC_SUCCESS {
+                return Err(TpuError::new(format!(
+                    "CVI_NN_SetTensorWithAlignedFrames TDMA import failed: {rc}"
+                )));
+            }
+
+            let (detections, forward_us, postprocess_us) =
+                self.forward_and_detections(config, source_width, source_height)?;
+            if let Some(t) = timing.as_deref_mut() {
+                *t = InferTiming {
+                    decode_us: 0,
+                    resize_us: 0,
+                    preprocess_us,
+                    forward_us,
+                    postprocess_us,
+                };
+            }
+            Ok(detections)
+        }
+
         pub fn infer(
             &mut self,
             frame: &CameraFrame,
@@ -440,10 +518,12 @@ mod imp {
             image_w: i32,
             image_h: i32,
         ) -> Result<(Vec<Detection>, i64, i64), TpuError> {
-            eprintln!(
-                "[tpu] CVI_NN_Forward(model={:p}, inputs={:p}, input_num={}, outputs={:p}, output_num={}) ...",
-                self.model, self.inputs, self.input_num, self.outputs, self.output_num
-            );
+            if config.debug_logging {
+                eprintln!(
+                    "[tpu-debug] CVI_NN_Forward model={:p} inputs={:p} input_num={} outputs={:p} output_num={}",
+                    self.model, self.inputs, self.input_num, self.outputs, self.output_num
+                );
+            }
             let fwd_start = Instant::now();
             let rc = unsafe {
                 CVI_NN_Forward(
@@ -455,15 +535,21 @@ mod imp {
                 )
             };
             let forward_us = fwd_start.elapsed().as_micros() as i64;
-            eprintln!("[tpu] CVI_NN_Forward → rc={} time={}us", rc, forward_us);
+            if config.debug_logging {
+                eprintln!("[tpu-debug] CVI_NN_Forward rc={rc} time_us={forward_us}");
+            }
             if rc != CVI_RC_SUCCESS {
                 return Err(TpuError::new(format!("CVI_NN_Forward failed: {rc}")));
             }
 
-            eprintln!("[tpu] get_detections ...");
             let post_start = Instant::now();
             let mut detections = self.get_detections(config)?;
-            eprintln!("[tpu] get_detections → {} raw detections", detections.len());
+            if config.debug_logging {
+                eprintln!(
+                    "[tpu-debug] parsed_detections_before_nms={}",
+                    detections.len()
+                );
+            }
             nms(&mut detections, config.iou_threshold);
             correct_yolo_boxes(
                 &mut detections,
@@ -539,21 +625,54 @@ mod imp {
             let output = unsafe { &mut *self.outputs };
             let shape = self.output_shapes[0];
             let count = output.count;
-            eprintln!(
-                "[tpu] get_detections: output={:p} shape={:?} count={} fmt={} qscale={} zero_point={}",
-                output, shape, count, output.fmt, output.qscale, output.zero_point
-            );
+            if config.debug_logging {
+                eprintln!(
+                    "[tpu-debug] output={:p} shape={:?} count={} fmt={} qscale={} zero_point={}",
+                    output, shape, count, output.fmt, output.qscale, output.zero_point
+                );
+            }
             let ptr = unsafe { CVI_NN_TensorPtr(output as *mut CviTensor) };
-            eprintln!("[tpu] CVI_NN_TensorPtr → {:p}", ptr);
+            if config.debug_logging {
+                eprintln!("[tpu-debug] output_tensor_ptr={ptr:p}");
+            }
             if ptr.is_null() {
                 return Err(TpuError::new("output tensor pointer is null"));
             }
 
-            let data = tensor_to_f32(output, ptr, count)?;
-            eprintln!("[tpu] tensor_to_f32 → {} elements", data.len());
+            let shape = [shape.dim[0], shape.dim[1], shape.dim[2], shape.dim[3]];
+            if output.fmt == CVI_FMT_FP32 {
+                // The validated tennis model exposes an FP32 output tensor.
+                // Parse the runtime-owned buffer in place: copying all 42,000
+                // elements to a temporary Vec used to be charged to every
+                // frame's postprocess time even though the parser only reads it.
+                let data = unsafe { slice::from_raw_parts(ptr as *const f32, count) };
+                if config.debug_logging {
+                    eprintln!(
+                        "[tpu-debug] output_elements={} parse_path=direct-fp32",
+                        data.len()
+                    );
+                }
+                return Ok(parse_yolov8_output(
+                    data,
+                    shape,
+                    config.classes_num,
+                    config.confidence_threshold,
+                ));
+            }
+
+            // Quantized/BF16 output models still need dequantization. Keep the
+            // compatibility path separate so the common FP32 case remains
+            // allocation- and copy-free.
+            let data = tensor_to_f32(output, ptr, count, config.debug_logging)?;
+            if config.debug_logging {
+                eprintln!(
+                    "[tpu-debug] output_elements={} parse_path=dequantized",
+                    data.len()
+                );
+            }
             Ok(parse_yolov8_output(
                 &data,
-                [shape.dim[0], shape.dim[1], shape.dim[2], shape.dim[3]],
+                shape,
                 config.classes_num,
                 config.confidence_threshold,
             ))
@@ -584,30 +703,24 @@ mod imp {
         tensor: &CviTensor,
         ptr: *mut c_void,
         count: usize,
+        debug_logging: bool,
     ) -> Result<Vec<f32>, TpuError> {
-        eprintln!(
-            "[tpu] tensor_to_f32: fmt={} count={} ptr={:p}",
-            tensor.fmt, count, ptr
-        );
+        if debug_logging {
+            eprintln!(
+                "[tpu-debug] tensor_to_f32 fmt={} count={} ptr={ptr:p}",
+                tensor.fmt, count
+            );
+        }
         match tensor.fmt {
             CVI_FMT_FP32 => {
-                eprintln!(
-                    "[tpu] tensor_to_f32: FP32 path, reading {} f32s from {:p}",
-                    count, ptr
-                );
                 let src = unsafe { slice::from_raw_parts(ptr as *const f32, count) };
                 Ok(src.to_vec())
             }
             CVI_FMT_INT8 => {
-                eprintln!("[tpu] tensor_to_f32: INT8 path, qscale={}", tensor.qscale);
                 let src = unsafe { slice::from_raw_parts(ptr as *const i8, count) };
                 Ok(src.iter().map(|v| *v as f32 * tensor.qscale).collect())
             }
             CVI_FMT_UINT8 => {
-                eprintln!(
-                    "[tpu] tensor_to_f32: UINT8 path, qscale={} zero_point={}",
-                    tensor.qscale, tensor.zero_point
-                );
                 let src = unsafe { slice::from_raw_parts(ptr as *const u8, count) };
                 Ok(src
                     .iter()
@@ -615,7 +728,6 @@ mod imp {
                     .collect())
             }
             CVI_FMT_BF16 => {
-                eprintln!("[tpu] tensor_to_f32: BF16 path");
                 let src = unsafe { slice::from_raw_parts(ptr as *const u16, count) };
                 Ok(src
                     .iter()
@@ -623,7 +735,6 @@ mod imp {
                     .collect())
             }
             CVI_FMT_INT16 => {
-                eprintln!("[tpu] tensor_to_f32: INT16 path, qscale={}", tensor.qscale);
                 let src = unsafe { slice::from_raw_parts(ptr as *const i16, count) };
                 Ok(src.iter().map(|v| *v as f32 * tensor.qscale).collect())
             }
@@ -670,6 +781,22 @@ mod imp {
         ) -> Result<Vec<Detection>, TpuError> {
             Err(TpuError::new(
                 "aligned physical inference requires SG2002 TPU runtime support",
+            ))
+        }
+
+        /// # Safety
+        ///
+        /// The host stub never dereferences the supplied physical address.
+        pub unsafe fn infer_vpss_rgb_timed(
+            &mut self,
+            _paddr: u64,
+            _source_width: i32,
+            _source_height: i32,
+            _config: InferenceConfig,
+            _timing: Option<&mut InferTiming>,
+        ) -> Result<Vec<Detection>, TpuError> {
+            Err(TpuError::new(
+                "VPSS TDMA inference requires SG2002 TPU runtime support",
             ))
         }
 

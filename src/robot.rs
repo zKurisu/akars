@@ -20,6 +20,8 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub struct RobotConfig {
     pub inference: InferenceConfig,
     pub max_frames: Option<u64>,
+    /// Stop safely after this many verified grab -> deposit cycles.
+    pub max_deposits: Option<u32>,
 }
 
 impl Default for RobotConfig {
@@ -27,6 +29,7 @@ impl Default for RobotConfig {
         Self {
             inference: InferenceConfig::default(),
             max_frames: None,
+            max_deposits: None,
         }
     }
 }
@@ -48,6 +51,7 @@ struct RobotState {
     grab_confirm_count: i32,
     holding_ball: bool,
     red_confirm_count: u32,
+    slow_search_after_deposit: bool,
 }
 
 impl Default for RobotState {
@@ -59,6 +63,7 @@ impl Default for RobotState {
             grab_confirm_count: 0,
             holding_ball: false,
             red_confirm_count: 0,
+            slow_search_after_deposit: false,
         }
     }
 }
@@ -71,6 +76,7 @@ impl RobotState {
         self.ball_cx = 0;
         self.grab_confirm_count = 0;
         self.red_confirm_count = 0;
+        self.slow_search_after_deposit = false;
     }
 
     fn mark_deposit_complete(&mut self) {
@@ -80,10 +86,27 @@ impl RobotState {
         self.ball_cx = 0;
         self.grab_confirm_count = 0;
         self.red_confirm_count = 0;
+        self.slow_search_after_deposit = true;
     }
 
     fn may_approach_red(&self) -> bool {
         self.holding_ball
+    }
+
+    fn search_speed(&self) -> i32 {
+        if self.slow_search_after_deposit {
+            POST_DEPOSIT_SEARCH_SPEED
+        } else {
+            IDLE_SPEED
+        }
+    }
+
+    fn turn_speed(&self) -> i32 {
+        if self.slow_search_after_deposit {
+            POST_DEPOSIT_SEARCH_SPEED
+        } else {
+            TURN_SPEED
+        }
     }
 }
 
@@ -95,11 +118,20 @@ const GRAB_AREA: f32 = 0.55;
 // the ball jump across the target centre between frames. Accept a wider
 // centred region and correct only the portion outside it with a short pulse.
 const CENTER_MARGIN: i32 = 55;
+/// A slightly wider dead band used only after the ball has reached grab size.
+/// It prevents a target at x=288 from being rejected by the normal [290,400]
+/// steering window while leaving far-ball steering unchanged.
+const GRAB_CENTER_MARGIN: i32 = 60;
 /// Offset the "centred" target position to the right of image centre.
 /// 0 = dead centre, positive = rightward.  Unit: pixels at 640×480.
 const GRAB_CENTER_OFFSET: i32 = 25;
 const BALL_TURN_PULSE_MIN_US: u64 = 15_000;
 const BALL_TURN_PULSE_MAX_US: u64 = 45_000;
+/// Close-ball corrections must overcome chassis static friction. Do not reuse
+/// the post-deposit search speed or the 15 ms far-target pulse here.
+const CLOSE_BALL_TURN_SPEED: i32 = 10;
+const CLOSE_BALL_TURN_PULSE_MIN_US: u64 = 30_000;
+const CLOSE_BALL_TURN_PULSE_MAX_US: u64 = 60_000;
 /// Only back up if the ball literally fills nearly the whole frame.
 const GRAB_AREA_MAX: f32 = 0.85;
 const CHASE_SPEED: i32 = 45;
@@ -128,6 +160,108 @@ enum RedMissionAction {
     Chase(ChaseMotion),
     HoldForConfirmation,
     Deposit,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StageTimingSample {
+    camera_wait_us: u64,
+    jpu_decode_us: u64,
+    vpss_queue_us: u64,
+    vpss_hardware_us: u64,
+    vpss_wake_return_us: u64,
+    vpss_wait_us: u64,
+    tdma_us: u64,
+    tpu_forward_us: u64,
+    postprocess_us: u64,
+    vision_total_us: u64,
+    motion_control_us: u64,
+    actuator_blocking_us: u64,
+    other_us: u64,
+    frame_total_us: u64,
+}
+
+#[derive(Debug, Default)]
+struct StageTimingTotals {
+    frames: u64,
+    sum: StageTimingSample,
+}
+
+impl StageTimingTotals {
+    fn record(&mut self, sample: StageTimingSample) {
+        self.frames = self.frames.saturating_add(1);
+        self.sum.camera_wait_us = self.sum.camera_wait_us.saturating_add(sample.camera_wait_us);
+        self.sum.jpu_decode_us = self.sum.jpu_decode_us.saturating_add(sample.jpu_decode_us);
+        self.sum.vpss_queue_us = self.sum.vpss_queue_us.saturating_add(sample.vpss_queue_us);
+        self.sum.vpss_hardware_us = self
+            .sum
+            .vpss_hardware_us
+            .saturating_add(sample.vpss_hardware_us);
+        self.sum.vpss_wake_return_us = self
+            .sum
+            .vpss_wake_return_us
+            .saturating_add(sample.vpss_wake_return_us);
+        self.sum.vpss_wait_us = self.sum.vpss_wait_us.saturating_add(sample.vpss_wait_us);
+        self.sum.tdma_us = self.sum.tdma_us.saturating_add(sample.tdma_us);
+        self.sum.tpu_forward_us = self.sum.tpu_forward_us.saturating_add(sample.tpu_forward_us);
+        self.sum.postprocess_us = self.sum.postprocess_us.saturating_add(sample.postprocess_us);
+        self.sum.vision_total_us = self.sum.vision_total_us.saturating_add(sample.vision_total_us);
+        self.sum.motion_control_us = self
+            .sum
+            .motion_control_us
+            .saturating_add(sample.motion_control_us);
+        self.sum.actuator_blocking_us = self
+            .sum
+            .actuator_blocking_us
+            .saturating_add(sample.actuator_blocking_us);
+        self.sum.other_us = self.sum.other_us.saturating_add(sample.other_us);
+        self.sum.frame_total_us = self.sum.frame_total_us.saturating_add(sample.frame_total_us);
+    }
+
+    fn print_average(&self, mode: &str, report: &str) {
+        if self.frames == 0 {
+            return;
+        }
+        let avg = |total: u64| total / self.frames;
+        eprintln!(
+            "AKARS_STAGE_AVERAGE report={} mode={} frames={} camera_wait_us={} jpu_decode_us={} vpss_queue_us={} vpss_hw_us={} vpss_wake_return_us={} vpss_wait_us={} vpss_wall_us={} tdma_us={} tpu_forward_us={} postprocess_us={} vision_total_us={} motion_control_us={} actuator_blocking_us={} other_us={} frame_total_us={}",
+            report,
+            mode,
+            self.frames,
+            avg(self.sum.camera_wait_us),
+            avg(self.sum.jpu_decode_us),
+            avg(self.sum.vpss_queue_us),
+            avg(self.sum.vpss_hardware_us),
+            avg(self.sum.vpss_wake_return_us),
+            avg(self.sum.vpss_wait_us),
+            avg(self
+                .sum
+                .vpss_queue_us
+                .saturating_add(self.sum.vpss_hardware_us)
+                .saturating_add(self.sum.vpss_wake_return_us)),
+            avg(self.sum.tdma_us),
+            avg(self.sum.tpu_forward_us),
+            avg(self.sum.postprocess_us),
+            avg(self.sum.vision_total_us),
+            avg(self.sum.motion_control_us),
+            avg(self.sum.actuator_blocking_us),
+            avg(self.sum.other_us),
+            avg(self.sum.frame_total_us),
+        );
+        eprintln!(
+            "AKARS_INFERENCE_AVERAGE report={} mode={} frames={} tdma_us={} tpu_forward_us={} postprocess_us={} inference_total_us={}",
+            report,
+            mode,
+            self.frames,
+            avg(self.sum.tdma_us),
+            avg(self.sum.tpu_forward_us),
+            avg(self.sum.postprocess_us),
+            avg(self
+                .sum
+                .tdma_us
+                .saturating_add(self.sum.tpu_forward_us)
+                .saturating_add(self.sum.postprocess_us)),
+        );
+    }
 }
 
 /// Motor decision shared by the tennis hunter and any target follower that
@@ -161,10 +295,27 @@ pub fn run_tennis_hunter(
     mut arm: Arm,
     config: RobotConfig,
 ) {
+    let aligned_input = model.input_contract().aligned;
+    eprintln!(
+        "[tpu] robot input path={}",
+        if aligned_input {
+            "aligned-zero-copy"
+        } else {
+            "vpss-tdma"
+        }
+    );
+    eprintln!(
+        "AKARS_TPU_DEBUG enabled={} per_frame_timing={} final_average=1",
+        u8::from(config.inference.debug_logging),
+        u8::from(config.inference.debug_logging),
+    );
     let mut robot = RobotState::default();
     let mut frame_idx = 0u64;
     let mut total_time = Duration::ZERO;
     let mut frame_count = 0u64;
+    let mut tennis_timing = StageTimingTotals::default();
+    let mut red_timing = StageTimingTotals::default();
+    let mut completed_deposits = 0u32;
     let mut camera_errors = 0u32;
     // Recovery tier: 0=not tried yet, 1=re_init tried, 2=reopen tried,
     // 3=hard_reset tried.
@@ -182,7 +333,8 @@ pub fn run_tennis_hunter(
         "[cfg] GRAB_AREA={:.3} GRAB_AREA_MAX={:.3} \
          CHASE_SPEED={CHASE_SPEED} CONFIRM={GRAB_CONFIRM_THRESHOLD} \
          IDLE={IDLE_SPEED} CENTER={CENTER_MARGIN}±{GRAB_CENTER_OFFSET} \
-         BALL_TURN_PULSE=[{BALL_TURN_PULSE_MIN_US}..{BALL_TURN_PULSE_MAX_US}]us \
+         GRAB_CENTER={GRAB_CENTER_MARGIN} CLOSE_TURN={CLOSE_BALL_TURN_SPEED} \
+         CLOSE_PULSE=[{CLOSE_BALL_TURN_PULSE_MIN_US}..{CLOSE_BALL_TURN_PULSE_MAX_US}]us \
          RED_STOP={:.0}%x{:.0}% RED_CONFIRM={DEFAULT_RED_STOP_CONFIRM_FRAMES}",
         GRAB_AREA,
         GRAB_AREA_MAX,
@@ -200,7 +352,12 @@ pub fn run_tennis_hunter(
         let frame_start = Instant::now();
         frame_idx += 1;
 
-        let frame = match pipeline.next(2_000) {
+        let red_mode = robot.may_approach_red();
+        let frame = match if red_mode {
+            pipeline.next_yuv(2_000)
+        } else {
+            pipeline.next(2_000)
+        } {
             Ok(frame) => {
                 camera_errors = 0;
                 camera_recoveries = 0;
@@ -235,14 +392,28 @@ pub fn run_tennis_hunter(
                 continue;
             }
         };
-        let capture_us = frame.camera_request_us as i64;
+        let camera_ioctl_wall_us = frame.camera_request_us as i64;
+        let jpu_decode_us = frame.jpu_decode_us as i64;
+        let camera_wait_wall_us = camera_ioctl_wall_us.saturating_sub(jpu_decode_us);
+        let camera_capture_async_us = frame.meta.profile.frame_total_us as i64;
+        let uvc_async_us = frame.meta.profile.uvc_total_us as i64;
         let vpss_wall_us = frame.vpss_wall_us as i64;
-        let vpss_hardware_us = frame.vpss_hardware_us as i64;
+        let vpss_queue_us = frame.vpss_queue_us as i64;
+        let vpss_hardware_irq_us = frame.vpss_hardware_us as i64;
+        let vpss_wake_return_us = frame.vpss_wake_return_us as i64;
+        let vpss_timestamps_valid = frame.vpss_timestamps_valid;
         let sequence = frame.meta.sequence;
 
         let mut timing = InferTiming::default();
+        let mode = if red_mode {
+            "red"
+        } else {
+            "tennis"
+        };
+        let holding_ball_before = robot.holding_ball;
         let handle_start = Instant::now();
-        if robot.may_approach_red() {
+        if red_mode {
+            debug_assert!(!frame.vpss_executed);
             handle_red_container(
                 frame.yuv,
                 frame.yuv_width as usize,
@@ -252,24 +423,35 @@ pub fn run_tennis_hunter(
                 &mut arm,
             );
         } else {
-            let frame_paddrs = [frame.physical_address];
+            debug_assert!(frame.vpss_executed);
             // SAFETY: VpssRgbPipeline owns the destination ION allocation and
             // keeps it live until this blocking inference and postprocess return.
             let detections = match unsafe {
-                model.infer_aligned_physical_timed(
-                    AlignedPhysicalFrames {
-                        frame_paddrs: &frame_paddrs,
-                        pixel_format: PhysicalPixelFormat::RgbPlanar,
-                        source_width: CAMERA_WIDTH as i32,
-                        source_height: CAMERA_HEIGHT as i32,
-                    },
-                    config.inference,
-                    Some(&mut timing),
-                )
+                if aligned_input {
+                    let frame_paddrs = [frame.physical_address];
+                    model.infer_aligned_physical_timed(
+                        AlignedPhysicalFrames {
+                            frame_paddrs: &frame_paddrs,
+                            pixel_format: PhysicalPixelFormat::RgbPlanar,
+                            source_width: CAMERA_WIDTH as i32,
+                            source_height: CAMERA_HEIGHT as i32,
+                        },
+                        config.inference,
+                        Some(&mut timing),
+                    )
+                } else {
+                    model.infer_vpss_rgb_timed(
+                        frame.physical_address,
+                        CAMERA_WIDTH as i32,
+                        CAMERA_HEIGHT as i32,
+                        config.inference,
+                        Some(&mut timing),
+                    )
+                }
             } {
                 Ok(detections) => detections,
                 Err(err) => {
-                    eprintln!("[detect] aligned VPSS inference failed: {err}");
+                    eprintln!("[detect] VPSS inference failed: {err}");
                     motor.standby();
                     sleep_us(100_000);
                     continue;
@@ -287,21 +469,101 @@ pub fn run_tennis_hunter(
         let handle_us = handle_start.elapsed().as_micros() as i64;
 
         let frame_time = frame_start.elapsed();
+        let total_us = frame_time.as_micros() as i64;
+        let infer_and_post_us = timing
+            .preprocess_us
+            .saturating_add(timing.forward_us)
+            .saturating_add(timing.postprocess_us);
+        let control_us = handle_us.saturating_sub(infer_and_post_us);
+        let accounted_us = camera_ioctl_wall_us
+            .saturating_add(vpss_wall_us)
+            .saturating_add(handle_us);
+        let other_us = total_us.saturating_sub(accounted_us);
+        let vpss_wait_us = vpss_queue_us.saturating_add(vpss_wake_return_us);
+        let vision_total_us = camera_wait_wall_us
+            .saturating_add(jpu_decode_us)
+            .saturating_add(vpss_queue_us)
+            .saturating_add(vpss_hardware_irq_us)
+            .saturating_add(vpss_wake_return_us)
+            .saturating_add(timing.preprocess_us)
+            .saturating_add(timing.forward_us)
+            .saturating_add(timing.postprocess_us);
+        let actuator_blocking_us = if holding_ball_before != robot.holding_ball {
+            control_us
+        } else {
+            0
+        };
+        let motion_control_us = control_us.saturating_sub(actuator_blocking_us);
+        let sample = StageTimingSample {
+            camera_wait_us: camera_wait_wall_us.max(0) as u64,
+            jpu_decode_us: jpu_decode_us.max(0) as u64,
+            vpss_queue_us: vpss_queue_us.max(0) as u64,
+            vpss_hardware_us: vpss_hardware_irq_us.max(0) as u64,
+            vpss_wake_return_us: vpss_wake_return_us.max(0) as u64,
+            vpss_wait_us: vpss_wait_us.max(0) as u64,
+            tdma_us: timing.preprocess_us.max(0) as u64,
+            tpu_forward_us: timing.forward_us.max(0) as u64,
+            postprocess_us: timing.postprocess_us.max(0) as u64,
+            vision_total_us: vision_total_us.max(0) as u64,
+            motion_control_us: motion_control_us.max(0) as u64,
+            actuator_blocking_us: actuator_blocking_us.max(0) as u64,
+            other_us: other_us.max(0) as u64,
+            frame_total_us: total_us.max(0) as u64,
+        };
 
-        eprintln!(
-            "[time] seq={} cap={:.1} vpss={:.1}(hw={:.1}) pre={:.1}(dec={:.1} rsz={:.1}) fwd={:.1} post={:.1} handle={:.1} total={:.1} ms",
-            sequence,
-            capture_us as f32 / 1000.0,
-            vpss_wall_us as f32 / 1000.0,
-            vpss_hardware_us as f32 / 1000.0,
-            timing.preprocess_us as f32 / 1000.0,
-            timing.decode_us as f32 / 1000.0,
-            timing.resize_us as f32 / 1000.0,
-            timing.forward_us as f32 / 1000.0,
-            timing.postprocess_us as f32 / 1000.0,
-            handle_us as f32 / 1000.0,
-            frame_time.as_secs_f32() * 1000.0,
-        );
+        if config.inference.debug_logging {
+            eprintln!(
+                "AKARS_STAGE_TIMING seq={} mode={} camera_wait_us={} jpu_decode_us={} vpss_queue_us={} vpss_hw_us={} vpss_wake_return_us={} vpss_wait_us={} vpss_wall_us={} vpss_timestamps_valid={} tdma_us={} tpu_forward_us={} postprocess_us={} vision_total_us={} motion_control_us={} actuator_blocking_us={} other_us={} frame_total_us={}",
+                sequence,
+                mode,
+                sample.camera_wait_us,
+                sample.jpu_decode_us,
+                sample.vpss_queue_us,
+                sample.vpss_hardware_us,
+                sample.vpss_wake_return_us,
+                sample.vpss_wait_us,
+                sample
+                    .vpss_queue_us
+                    .saturating_add(sample.vpss_hardware_us)
+                    .saturating_add(sample.vpss_wake_return_us),
+                u8::from(vpss_timestamps_valid),
+                sample.tdma_us,
+                sample.tpu_forward_us,
+                sample.postprocess_us,
+                sample.vision_total_us,
+                sample.motion_control_us,
+                sample.actuator_blocking_us,
+                sample.other_us,
+                sample.frame_total_us,
+            );
+            if frame_idx % 30 == 0 {
+                eprintln!(
+                    "AKARS_ASYNC_CAPTURE_TIMING seq={} uvc_async_us={} capture_async_us={} note=overlaps_foreground_not_additive",
+                    sequence,
+                    uvc_async_us.max(0),
+                    camera_capture_async_us.max(0),
+                );
+            }
+        }
+        let mode_totals = if mode == "tennis" {
+            &mut tennis_timing
+        } else {
+            &mut red_timing
+        };
+        mode_totals.record(sample);
+        if holding_ball_before && !robot.holding_ball {
+            completed_deposits = completed_deposits.saturating_add(1);
+            eprintln!(
+                "AKARS_MISSION_PROGRESS completed_deposits={} target_deposits={}",
+                completed_deposits,
+                config
+                    .max_deposits
+                    .map_or_else(|| "unlimited".to_string(), |value| value.to_string()),
+            );
+        }
+        if config.inference.debug_logging && mode_totals.frames % 30 == 0 {
+            mode_totals.print_average(mode, "periodic");
+        }
         total_time += frame_time;
         frame_count += 1;
         let fps = if frame_time.as_secs_f32() > 0.0 {
@@ -326,9 +588,26 @@ pub fn run_tennis_hunter(
             robot.grab_confirm_count,
             robot.red_confirm_count,
         );
+        if config
+            .max_deposits
+            .is_some_and(|target| completed_deposits >= target)
+        {
+            eprintln!(
+                "AKARS_MISSION_COMPLETE completed_deposits={} reason=target_reached",
+                completed_deposits
+            );
+            break;
+        }
     }
 
+    tennis_timing.print_average("tennis", "final");
+    red_timing.print_average("red", "final");
     motor.standby();
+    eprintln!(
+        "AKARS_MISSION_SUMMARY completed_deposits={} holding_ball={}",
+        completed_deposits,
+        u8::from(robot.holding_ball)
+    );
 }
 
 fn handle_detections(
@@ -356,8 +635,23 @@ fn handle_detections(
         robot.grab_confirm_count = 0;
         robot.status = RobotStatus::ChaseTennis;
         // Continuous clockwise rotation while searching — no stop.
-        search_for_target(motor);
+        if robot.search_speed() == POST_DEPOSIT_SEARCH_SPEED {
+            eprintln!("[detect] post-deposit slow search speed={POST_DEPOSIT_SEARCH_SPEED}");
+            search_for_target_after_deposit(motor);
+        } else {
+            search_for_target(motor);
+        }
         return;
+    }
+
+    // The 6/-6 setting is deliberately limited to blind post-deposit search.
+    // As soon as a ball is acquired, return to the original chase steering
+    // speed so short correction pulses can overcome chassis static friction.
+    if robot.slow_search_after_deposit {
+        robot.slow_search_after_deposit = false;
+        eprintln!(
+            "[detect] target acquired, restoring chase turn speed={TURN_SPEED}"
+        );
     }
 
     let best = detections
@@ -373,7 +667,11 @@ fn handle_detections(
     let area_ratio = (best.bbox.w * best.bbox.h) / image_area;
     let ball_cx = best.bbox.x as i32;
     let chase_motion = chase_motion(ball_cx, area_ratio, image_w);
-    let centered = matches!(chase_motion, ChaseMotion::Forward(_));
+    let centered = if area_ratio >= GRAB_AREA {
+        grab_centered(ball_cx, image_w)
+    } else {
+        matches!(chase_motion, ChaseMotion::Forward(_))
+    };
 
     robot.area_ratio = area_ratio;
     robot.ball_cx = ball_cx;
@@ -416,13 +714,20 @@ fn handle_detections(
             );
         }
     } else if area_ratio >= GRAB_AREA && !centered {
-        // Big but off-centre — align to centre the ball, keep progress.
-        execute_chase_motion(chase_motion, motor);
+        // Big but off-centre: use a pulse and speed that can overcome chassis
+        // static friction. In particular, do not inherit the post-deposit
+        // search speed of 6 for this final alignment.
+        let close_motion = close_ball_alignment_motion(ball_cx, image_w);
+        eprintln!(
+            "[grab] close alignment cx={} speed={} motion={:?}",
+            ball_cx, CLOSE_BALL_TURN_SPEED, close_motion
+        );
+        execute_chase_motion_at_turn_speed(close_motion, CLOSE_BALL_TURN_SPEED, motor);
     } else {
         // Ball is still far — chase.
         robot.grab_confirm_count = 0;
         robot.status = RobotStatus::ChaseTennis;
-        execute_chase_motion(chase_motion, motor);
+        execute_chase_motion_at_turn_speed(chase_motion, robot.turn_speed(), motor);
     }
 }
 
@@ -588,6 +893,30 @@ pub fn chase_motion(target_cx: i32, area_ratio: f32, image_w: i32) -> ChaseMotio
     }
 }
 
+fn grab_centered(target_cx: i32, image_w: i32) -> bool {
+    let center = image_w / 2 + scaled_center_margin(image_w, GRAB_CENTER_OFFSET);
+    let margin = scaled_center_margin(image_w, GRAB_CENTER_MARGIN);
+    (target_cx - center).abs() <= margin
+}
+
+fn close_ball_alignment_motion(target_cx: i32, image_w: i32) -> ChaseMotion {
+    let center = image_w / 2 + scaled_center_margin(image_w, GRAB_CENTER_OFFSET);
+    let margin = scaled_center_margin(image_w, GRAB_CENTER_MARGIN);
+    let offset = target_cx - center;
+    if offset.abs() <= margin {
+        ChaseMotion::Forward(0)
+    } else {
+        let excess = offset.abs().saturating_sub(margin) as u64;
+        let pulse_us = (CLOSE_BALL_TURN_PULSE_MIN_US + excess.saturating_mul(300))
+            .clamp(CLOSE_BALL_TURN_PULSE_MIN_US, CLOSE_BALL_TURN_PULSE_MAX_US);
+        if offset < 0 {
+            ChaseMotion::TurnLeft(pulse_us)
+        } else {
+            ChaseMotion::TurnRight(pulse_us)
+        }
+    }
+}
+
 /// Steer toward the red container without the left/right oscillation caused
 /// by applying the small-ball controller to a large, noisy red bounding box.
 fn red_chase_motion(red: RedObservation) -> ChaseMotion {
@@ -615,10 +944,14 @@ fn red_chase_motion(red: RedObservation) -> ChaseMotion {
 }
 
 pub fn execute_chase_motion(motion: ChaseMotion, motor: &mut Motor) {
+    execute_chase_motion_at_turn_speed(motion, TURN_SPEED, motor);
+}
+
+fn execute_chase_motion_at_turn_speed(motion: ChaseMotion, turn_speed: i32, motor: &mut Motor) {
     match motion {
         ChaseMotion::Forward(speed) => motor.forward(speed),
-        ChaseMotion::TurnLeft(pulse_us) => align_target(-1, pulse_us, motor),
-        ChaseMotion::TurnRight(pulse_us) => align_target(1, pulse_us, motor),
+        ChaseMotion::TurnLeft(pulse_us) => align_target(-1, pulse_us, turn_speed, motor),
+        ChaseMotion::TurnRight(pulse_us) => align_target(1, pulse_us, turn_speed, motor),
     }
 }
 
@@ -639,11 +972,11 @@ pub fn chase_speed(area_ratio: f32) -> i32 {
     speed.max(6.0).round() as i32
 }
 
-fn align_target(offset: i32, pulse_us: u64, motor: &mut Motor) {
+fn align_target(offset: i32, pulse_us: u64, turn_speed: i32, motor: &mut Motor) {
     if offset < 0 {
-        motor.drive(-TURN_SPEED, TURN_SPEED);
+        motor.drive(-turn_speed, turn_speed);
     } else {
-        motor.drive(TURN_SPEED, -TURN_SPEED);
+        motor.drive(turn_speed, -turn_speed);
     }
     sleep_us(pulse_us);
     motor.standby();
@@ -678,9 +1011,10 @@ fn sleep_us(us: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ball_turn_pulse_us, chase_motion, decide_red_action, scaled_center_margin, ChaseMotion,
-        RedMissionAction, RobotState, RobotStatus, BALL_TURN_PULSE_MAX_US, BALL_TURN_PULSE_MIN_US,
-        DEFAULT_RED_STOP_CONFIRM_FRAMES,
+        ball_turn_pulse_us, chase_motion, close_ball_alignment_motion, decide_red_action,
+        grab_centered, scaled_center_margin, ChaseMotion, RedMissionAction, RobotState,
+        RobotStatus, BALL_TURN_PULSE_MAX_US, BALL_TURN_PULSE_MIN_US,
+        CLOSE_BALL_TURN_PULSE_MIN_US, DEFAULT_RED_STOP_CONFIRM_FRAMES,
     };
     use crate::red_target::RedObservation;
 
@@ -721,6 +1055,35 @@ mod tests {
         };
         assert!(pulse_us <= 20_000);
         assert_eq!(chase_motion(303, 0.076, 640), ChaseMotion::Forward(33));
+    }
+
+    #[test]
+    fn close_ball_uses_wider_grab_only_dead_band() {
+        // Centre target is 320 + 25 = 345. The close-ball margin is 60,
+        // therefore the inclusive window is exactly [285, 405].
+        assert!(grab_centered(285, 640));
+        assert!(grab_centered(405, 640));
+        assert!(!grab_centered(284, 640));
+        assert!(!grab_centered(406, 640));
+
+        // The ordinary/far-target controller remains at +/-55 ([290, 400]).
+        assert!(matches!(
+            chase_motion(288, 0.10, 640),
+            ChaseMotion::TurnLeft(_)
+        ));
+        assert!(grab_centered(288, 640));
+    }
+
+    #[test]
+    fn close_ball_alignment_uses_effective_minimum_pulse() {
+        assert_eq!(
+            close_ball_alignment_motion(284, 640),
+            ChaseMotion::TurnLeft(CLOSE_BALL_TURN_PULSE_MIN_US + 300)
+        );
+        assert_eq!(
+            close_ball_alignment_motion(406, 640),
+            ChaseMotion::TurnRight(CLOSE_BALL_TURN_PULSE_MIN_US + 300)
+        );
     }
 
     #[test]
@@ -816,9 +1179,16 @@ mod tests {
         assert_eq!(robot.status, RobotStatus::ChaseTennis);
         assert!(!robot.holding_ball);
         assert_eq!(robot.red_confirm_count, 0);
+        assert!(robot.slow_search_after_deposit);
+        assert_eq!(robot.search_speed(), super::POST_DEPOSIT_SEARCH_SPEED);
+        assert_eq!(robot.turn_speed(), super::POST_DEPOSIT_SEARCH_SPEED);
         assert_eq!(
             decide_red_action(&mut robot, Some(red_observation(0, 0, 639, 479))),
             RedMissionAction::Ignore
         );
+        robot.mark_grab_complete();
+        assert!(!robot.slow_search_after_deposit);
+        assert_eq!(robot.search_speed(), super::IDLE_SPEED);
+        assert_eq!(robot.turn_speed(), super::TURN_SPEED);
     }
 }

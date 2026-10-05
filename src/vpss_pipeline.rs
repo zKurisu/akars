@@ -57,7 +57,7 @@ const CAMERA_IOCTL_STOP_ASYNC: c_ulong = 7;
 const CAMERA_IOCTL_GET_CAPTURE_STATS: c_ulong = 9;
 const CAMERA_IOCTL_RESET_CAPTURE_STATS: c_ulong = 10;
 const CAMERA_IOCTL_GET_LATEST_YUV_ION: c_ulong = 13;
-const CAMERA_ION_ABI_VERSION: u32 = 1;
+const CAMERA_ION_ABI_VERSION: u32 = 2;
 const CAMERA_FORMAT_YUV422_PLANAR: u8 = 3;
 
 const VPSS_ABI_VERSION: u32 = 1;
@@ -124,6 +124,7 @@ struct CameraIonFrameRequest {
     height: u16,
     format: u8,
     reserved: [u8; 3],
+    jpu_decode_us: u64,
     profile: CameraCaptureProfile,
 }
 
@@ -176,10 +177,49 @@ struct VpssRunYuv422pRgb {
     reserved: [u32; 4],
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VpssTimingBreakdown {
+    queue_us: u64,
+    hardware_us: u64,
+    wake_return_us: u64,
+    timestamps_valid: bool,
+}
+
+fn split_vpss_timing(
+    wall_us: u64,
+    queue_enter_ns: u64,
+    hardware_start_ns: u64,
+    hardware_done_ns: u64,
+    elapsed_ns: u64,
+) -> VpssTimingBreakdown {
+    let timestamps_valid = queue_enter_ns != 0
+        && hardware_start_ns >= queue_enter_ns
+        && hardware_done_ns >= hardware_start_ns;
+    let (queue_us, hardware_us) = if timestamps_valid {
+        (
+            hardware_start_ns.saturating_sub(queue_enter_ns) / 1_000,
+            hardware_done_ns.saturating_sub(hardware_start_ns) / 1_000,
+        )
+    } else {
+        (0, elapsed_ns / 1_000)
+    };
+    // Subtract the kernel-observed portions from userspace ioctl wall time.
+    // This boundary bucket includes syscall entry, IRQ wake-up/scheduling,
+    // return, and the sub-microsecond rounding residue, so all three reported
+    // stages add back to wall_us exactly.
+    let wake_return_us = wall_us.saturating_sub(queue_us.saturating_add(hardware_us));
+    VpssTimingBreakdown {
+        queue_us,
+        hardware_us,
+        wake_return_us,
+        timestamps_valid,
+    }
+}
+
 const _: [(); 56] = [(); size_of::<CameraCaptureProfile>()];
 const _: [(); 168] = [(); size_of::<CameraCaptureStats>()];
 const _: [(); 64] = [(); size_of::<IonAllocData>()];
-const _: [(); 160] = [(); size_of::<CameraIonFrameRequest>()];
+const _: [(); 168] = [(); size_of::<CameraIonFrameRequest>()];
 const _: [(); 248] = [(); size_of::<VpssRunYuv422pRgb>()];
 
 struct IonAllocation {
@@ -244,6 +284,7 @@ impl Drop for IonAllocation {
 }
 
 pub struct VpssRgbFrame<'a> {
+    pub vpss_executed: bool,
     pub physical_address: u64,
     pub rgb: &'a [u8],
     pub yuv: &'a [u8],
@@ -252,8 +293,15 @@ pub struct VpssRgbFrame<'a> {
     pub yuv_format: u8,
     pub meta: CameraFrameMeta,
     pub camera_request_us: u64,
+    pub jpu_decode_us: u64,
     pub vpss_wall_us: u64,
+    /// Time from entering the kernel VPSS queue to the MMIO start trigger.
+    pub vpss_queue_us: u64,
     pub vpss_hardware_us: u64,
+    /// ioctl wall time not covered by queue/programming or hardware execution.
+    /// This includes syscall entry plus IRQ wake-up, scheduling, and return.
+    pub vpss_wake_return_us: u64,
+    pub vpss_timestamps_valid: bool,
 }
 
 pub struct VpssRgbPipeline {
@@ -352,6 +400,21 @@ impl VpssRgbPipeline {
     }
 
     pub fn next(&mut self, timeout_ms: u32) -> io::Result<VpssRgbFrame<'_>> {
+        self.next_inner(timeout_ms, true)
+    }
+
+    /// Capture the latest JPU YUV422P frame without running VPSS.  The red
+    /// container detector consumes YUV directly, so producing an RGB tensor
+    /// in that mission phase only burns time and memory bandwidth.
+    pub fn next_yuv(&mut self, timeout_ms: u32) -> io::Result<VpssRgbFrame<'_>> {
+        self.next_inner(timeout_ms, false)
+    }
+
+    fn next_inner(
+        &mut self,
+        timeout_ms: u32,
+        execute_vpss: bool,
+    ) -> io::Result<VpssRgbFrame<'_>> {
         let mut camera = CameraIonFrameRequest {
             abi_version: CAMERA_ION_ABI_VERSION,
             ion_fd: self.source.file.as_raw_fd(),
@@ -422,24 +485,47 @@ impl VpssRgbPipeline {
             timeout_ms: 100,
             ..VpssRunYuv422pRgb::default()
         };
-        let vpss_start = Instant::now();
-        ioctl_ptr(&self.vpss, VPSS_IOCTL_RUN_YUV422P_RGB, &mut run)?;
-        let vpss_wall_us = vpss_start.elapsed().as_micros() as u64;
-        if run.status != 0 {
-            return Err(io::Error::other(format!(
-                "VPSS failed: status={} irq={:#x} img={:#x} axi={:#x} sc={:#x} odma={:#x}",
-                run.status,
-                run.irq_status,
-                run.img_debug,
-                run.img_axi_status,
-                run.scaler_status,
-                run.odma_debug
-            )));
-        }
+        let (vpss_wall_us, vpss_timing) = if execute_vpss {
+            let vpss_start = Instant::now();
+            ioctl_ptr(&self.vpss, VPSS_IOCTL_RUN_YUV422P_RGB, &mut run)?;
+            let wall_us = vpss_start.elapsed().as_micros() as u64;
+            if run.status != 0 {
+                return Err(io::Error::other(format!(
+                    "VPSS failed: status={} irq={:#x} img={:#x} axi={:#x} sc={:#x} odma={:#x}",
+                    run.status,
+                    run.irq_status,
+                    run.img_debug,
+                    run.img_axi_status,
+                    run.scaler_status,
+                    run.odma_debug
+                )));
+            }
+            (
+                wall_us,
+                split_vpss_timing(
+                    wall_us,
+                    run.queue_enter_ns,
+                    run.hardware_start_ns,
+                    run.hardware_done_ns,
+                    run.elapsed_ns,
+                ),
+            )
+        } else {
+            (0, VpssTimingBreakdown::default())
+        };
         self.sequence = camera.sequence;
         Ok(VpssRgbFrame {
-            physical_address: self.destination.physical_address,
-            rgb: &self.destination.as_slice()[..self.output_size],
+            vpss_executed: execute_vpss,
+            physical_address: if execute_vpss {
+                self.destination.physical_address
+            } else {
+                0
+            },
+            rgb: if execute_vpss {
+                &self.destination.as_slice()[..self.output_size]
+            } else {
+                &[]
+            },
             yuv: &self.source.as_slice()[yuv_start..yuv_end],
             yuv_width: u32::from(camera.width),
             yuv_height: u32::from(camera.height),
@@ -450,8 +536,12 @@ impl VpssRgbPipeline {
                 profile: camera.profile,
             },
             camera_request_us,
+            jpu_decode_us: camera.jpu_decode_us,
             vpss_wall_us,
-            vpss_hardware_us: run.elapsed_ns / 1_000,
+            vpss_queue_us: vpss_timing.queue_us,
+            vpss_hardware_us: vpss_timing.hardware_us,
+            vpss_wake_return_us: vpss_timing.wake_return_us,
+            vpss_timestamps_valid: vpss_timing.timestamps_valid,
         })
     }
 
@@ -515,5 +605,42 @@ fn ioctl_result(result: c_int) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{split_vpss_timing, VpssTimingBreakdown};
+
+    #[test]
+    fn splits_valid_kernel_timestamps_and_preserves_wall_total() {
+        let timing = split_vpss_timing(50_000, 1_000_000, 3_500_000, 5_000_000, 0);
+        assert_eq!(
+            timing,
+            VpssTimingBreakdown {
+                queue_us: 2_500,
+                hardware_us: 1_500,
+                wake_return_us: 46_000,
+                timestamps_valid: true,
+            }
+        );
+        assert_eq!(
+            timing.queue_us + timing.hardware_us + timing.wake_return_us,
+            50_000
+        );
+    }
+
+    #[test]
+    fn falls_back_to_elapsed_when_kernel_timestamps_are_unavailable() {
+        let timing = split_vpss_timing(9_000, 0, 0, 0, 2_250_000);
+        assert_eq!(
+            timing,
+            VpssTimingBreakdown {
+                queue_us: 0,
+                hardware_us: 2_250,
+                wake_return_us: 6_750,
+                timestamps_valid: false,
+            }
+        );
     }
 }

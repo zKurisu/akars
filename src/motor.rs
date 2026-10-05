@@ -1,7 +1,7 @@
 use crate::serial::SerialPort;
 use std::io;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const FRAME_SOF0: u8 = 0xAA;
 const FRAME_SOF1: u8 = 0x55;
@@ -53,7 +53,8 @@ impl Motor {
         let mut port = SerialPort::open(&config.device, 115200, true)?;
         eprintln!("[motor] port opened, waiting 500ms for ESP32");
         thread::sleep(Duration::from_millis(500));
-        let discarded = port.discard_input()?;
+        let discarded = port
+            .discard_input_until_quiet(Duration::from_millis(30), Duration::from_millis(1_000))?;
         eprintln!("[motor] discarded {discarded} stale RX byte(s)");
 
         let mut motor = Self {
@@ -129,37 +130,66 @@ impl Motor {
 
     fn command_expect_ack(&mut self, cmd: u8, payload: &[u8], label: &str) -> io::Result<()> {
         if let Some(port) = &mut self.port {
-            let discarded = port.discard_input()?;
+            let discarded = port
+                .discard_input_until_quiet(Duration::from_millis(20), Duration::from_millis(250))?;
             if discarded != 0 {
                 eprintln!("[motor] {label}: discarded {discarded} stale RX byte(s)");
             }
         }
         self.send_frame(cmd, payload)?;
-        match self.recv_frame(Duration::from_millis(500))? {
-            Some((RSP_ACK, ack_payload)) if ack_payload.first() == Some(&cmd) => {
-                eprintln!("[motor] {label}: ACK payload={ack_payload:02X?}");
-                Ok(())
+
+        let timeout = Duration::from_millis(1_000);
+        let deadline = Instant::now() + timeout;
+        let mut skipped_stale = 0usize;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{label}: controller did not reply with ACK for 0x{cmd:02X} within {}ms (skipped {skipped_stale} stale frame(s))",
+                        timeout.as_millis()
+                    ),
+                ));
             }
-            Some((RSP_ACK, ack_payload)) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{label}: stale/mismatched ACK payload={ack_payload:02X?}, expected command 0x{cmd:02X}"
-                ),
-            )),
-            Some((RSP_NACK, nack_payload)) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{label}: controller NACK payload={nack_payload:02X?}"),
-            )),
-            Some((response, response_payload)) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{label}: unexpected response 0x{response:02X} payload={response_payload:02X?}"
-                ),
-            )),
-            None => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("{label}: controller did not reply within 500ms"),
-            )),
+
+            match self.recv_frame(remaining)? {
+                Some((response, ack_payload))
+                    if is_ack_for_command(response, &ack_payload, cmd) =>
+                {
+                    eprintln!(
+                        "[motor] {label}: ACK payload={ack_payload:02X?} skipped_stale={skipped_stale}"
+                    );
+                    return Ok(());
+                }
+                Some((RSP_ACK, stale_payload)) => {
+                    skipped_stale += 1;
+                    eprintln!(
+                        "[motor] {label}: skipping stale ACK payload={stale_payload:02X?}, expected command 0x{cmd:02X}"
+                    );
+                }
+                Some((RSP_NACK, nack_payload)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{label}: controller NACK payload={nack_payload:02X?}"),
+                    ));
+                }
+                Some((response, response_payload)) => {
+                    skipped_stale += 1;
+                    eprintln!(
+                        "[motor] {label}: skipping stale response 0x{response:02X} payload={response_payload:02X?}"
+                    );
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "{label}: controller did not reply with ACK for 0x{cmd:02X} within {}ms (skipped {skipped_stale} stale frame(s))",
+                            timeout.as_millis()
+                        ),
+                    ));
+                }
+            }
         }
     }
 
@@ -183,6 +213,16 @@ impl Motor {
             .port
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "motor port closed"))?;
+        // Motion commands are acknowledged by the ESP32 even when the caller
+        // does not synchronously wait for them. Drain the previous command's
+        // already-arrived ACK before writing the next command so a long run
+        // cannot fill the UART RX ring with thousands of stale 0x13 ACKs.
+        let discarded = port.discard_input()?;
+        if discarded >= 64 {
+            eprintln!(
+                "[motor] discarded {discarded} accumulated ACK byte(s) before cmd=0x{cmd:02X}"
+            );
+        }
         port.write_all_drain(&frame)?;
         eprintln!("[motor] wrote cmd=0x{cmd:02X} len={} ok", payload.len());
         Ok(())
@@ -234,6 +274,10 @@ impl Drop for Motor {
     }
 }
 
+fn is_ack_for_command(response: u8, payload: &[u8], expected_command: u8) -> bool {
+    response == RSP_ACK && payload.first() == Some(&expected_command)
+}
+
 fn checksum(cmd: u8, len: u8, payload: &[u8]) -> u8 {
     payload.iter().fold(cmd ^ len, |acc, b| acc ^ *b)
 }
@@ -260,7 +304,15 @@ fn to_pwm(speed: i32, scale: i32) -> i16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{checksum, map_deadzone, to_pwm};
+    use super::{checksum, is_ack_for_command, map_deadzone, to_pwm, RSP_ACK};
+
+    #[test]
+    fn matches_only_the_requested_command_ack() {
+        assert!(is_ack_for_command(RSP_ACK, &[0x01], 0x01));
+        assert!(!is_ack_for_command(RSP_ACK, &[0x13], 0x01));
+        assert!(!is_ack_for_command(0x91, &[0x01], 0x01));
+        assert!(!is_ack_for_command(RSP_ACK, &[], 0x01));
+    }
 
     #[test]
     fn checksum_matches_protocol() {

@@ -82,6 +82,39 @@ impl SerialPort {
         }
         Ok(discarded)
     }
+
+    // Drain RX until no byte has arrived for `quiet_period`. This handles
+    // delayed replies that arrive just after a nonblocking read first reports
+    // `WouldBlock`; `max_duration` prevents a noisy device from hanging open.
+    pub fn discard_input_until_quiet(
+        &mut self,
+        quiet_period: Duration,
+        max_duration: Duration,
+    ) -> io::Result<usize> {
+        self.flush();
+        let started = Instant::now();
+        let mut quiet_since = Instant::now();
+        let mut discarded = 0usize;
+        let mut buffer = [0u8; 64];
+
+        loop {
+            match self.file.read(&mut buffer) {
+                Ok(0) => {}
+                Ok(count) => {
+                    discarded += count;
+                    quiet_since = Instant::now();
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+
+            if quiet_since.elapsed() >= quiet_period || started.elapsed() >= max_duration {
+                return Ok(discarded);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
 }
 
 fn configure(fd: i32, baudrate: i32) -> io::Result<()> {
